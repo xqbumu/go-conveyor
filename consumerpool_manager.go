@@ -2,6 +2,7 @@ package conveyor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -9,12 +10,12 @@ import (
 	"time"
 )
 
-// ConsumerPoolManager is responsible for managing task channels and consumer goroutine pools.
+// ConsumerPoolManager is responsible for managing task queues and consumer goroutine pools.
 type ConsumerPoolManager struct {
-	ctx          context.Context
-	wg           sync.WaitGroup    // Used to wait for all consumer goroutines to finish
-	taskChannels map[int]chan Task // Task channel map, key is priority, value is the corresponding task channel
-	mu           sync.RWMutex      // Read-write lock to protect concurrent access to taskChannels
+	ctx        context.Context
+	wg         sync.WaitGroup    // Used to wait for all consumer goroutines to finish
+	taskQueues map[int]TaskQueue // Task queue map, key is priority, value is the corresponding TaskQueue implementation
+	mu         sync.RWMutex      // Read-write lock to protect concurrent access to taskQueues
 
 	// Resource limitation related fields
 	currentConsumers int32                      // Current number of active consumer goroutines
@@ -22,20 +23,26 @@ type ConsumerPoolManager struct {
 }
 
 // NewConsumerPoolManager creates and initializes a new ConsumerPoolManager instance.
+// It takes a TaskQueueFactory function to create the appropriate TaskQueue implementation.
 func NewConsumerPoolManager(
 	ctx context.Context,
 	config *ConsumerPoolManagerConfig,
+	taskQueueFactory TaskQueueFactory, // Add TaskQueueFactory parameter
 ) *ConsumerPoolManager {
 	cpm := &ConsumerPoolManager{
-		ctx:          ctx,
-		taskChannels: make(map[int]chan Task),
-		config:       config,
+		ctx:        ctx,
+		taskQueues: make(map[int]TaskQueue),
+		config:     config,
 	}
 
-	// Create a default priority (0) channel with the default buffer size
-	// StartDefaultConsumers will be called in NewManager to start default consumers
-	cpm.taskChannels[0] = make(chan Task, cpm.config.DefaultBufferSize)
-	slog.Info("Created default task channel with initial buffer size", "priority", 0, "bufferSize", cpm.config.DefaultBufferSize)
+	// Create a default priority (0) task queue using the factory
+	defaultQueue, err := taskQueueFactory(0, cpm.config.DefaultBufferSize)
+	if err != nil {
+		slog.Error("Failed to create default task queue", "error", err)
+		return nil // Return nil if default queue creation fails
+	}
+	cpm.taskQueues[0] = defaultQueue
+	slog.Info("Created default task queue with initial buffer size", "priority", 0, "bufferSize", cpm.config.DefaultBufferSize)
 
 	slog.Info("ConsumerPoolManager created")
 	return cpm
@@ -43,50 +50,52 @@ func NewConsumerPoolManager(
 
 // StartDefaultConsumers starts the consumer goroutine pool for the default priority (0).
 func (cpm *ConsumerPoolManager) StartDefaultConsumers(processTask processTaskFunc) {
-	defaultTaskCh, ok := cpm.taskChannels[0]
+	defaultTaskQueue, ok := cpm.taskQueues[0]
 	if ok {
 		numConsumers := cpm.config.DefaultConsumers
 		slog.Info("Starting consumers for default priority (0)", "count", numConsumers)
 		for i := 0; i < numConsumers; i++ {
 			cpm.wg.Add(1)                             // Increase WaitGroup count
 			atomic.AddInt32(&cpm.currentConsumers, 1) // Increase active consumer count
-			go cpm.startConsumer(defaultTaskCh, processTask)
+			go cpm.startConsumer(defaultTaskQueue, processTask)
 		}
 	} else {
-		slog.Warn("Default task channel (0) not found, no consumers started for default priority.")
+		slog.Warn("Default task queue (0) not found, no consumers started for default priority.")
 	}
 }
 
-// GetOrCreateChannel gets the task channel for the specified priority.
-// If the channel does not exist, it attempts to create and start the corresponding consumer goroutine pool.
-// Returns the task channel and any possible error.
-func (cpm *ConsumerPoolManager) GetOrCreateChannel(priority int, taskIdentifier string, processTask processTaskFunc) (chan Task, error) {
+// GetOrCreateQueue gets the task queue for the specified priority.
+// If the queue does not exist, it attempts to create and start the corresponding consumer goroutine pool.
+// Returns the task queue and any possible error.
+func (cpm *ConsumerPoolManager) GetOrCreateQueue(priority int, taskIdentifier string, processTask processTaskFunc) (TaskQueue, error) {
 	cpm.mu.RLock()
-	taskCh, ok := cpm.taskChannels[priority]
+	taskQueue, ok := cpm.taskQueues[priority]
 	cpm.mu.RUnlock()
 
 	if !ok {
-		// Channel does not exist, need to create and start consumers
+		// Queue does not exist, need to create and start consumers
 		cpm.mu.Lock()
+		defer cpm.mu.Unlock() // Ensure unlock in case of early return
+
 		// Check again to prevent other goroutines from creating it
-		taskCh, ok = cpm.taskChannels[priority]
+		taskQueue, ok = cpm.taskQueues[priority]
 		if !ok {
-			// Create a new channel with the default buffer size
+			// Create a new queue with the default buffer size
 			defaultBufferSize := cpm.config.DefaultBufferSize
 
-			// Check if the maximum number of priority channels (excluding default priority 0) is exceeded
-			if priority != 0 && int32(len(cpm.taskChannels)-1) >= cpm.config.MaxPriorityChannels {
-				cpm.mu.Unlock()
-				err := fmt.Errorf("max priority channel limit (%d) reached, cannot create channel for priority %d", cpm.config.MaxPriorityChannels, priority)
-				slog.Error("Failed to get or create channel", "identifier", taskIdentifier, "priority", priority, "error", err)
+			// Check if the maximum number of priority queues (excluding default priority 0) is exceeded
+			if priority != 0 && int32(len(cpm.taskQueues)-1) >= cpm.config.MaxPriorityChannels { // Using MaxPriorityChannels config for now
+				err := fmt.Errorf("max priority queue limit (%d) reached, cannot create queue for priority %d", cpm.config.MaxPriorityChannels, priority)
+				slog.Error("Failed to get or create queue", "identifier", taskIdentifier, "priority", priority, "error", err)
 				return nil, err
 			}
 
-			taskCh = make(chan Task, defaultBufferSize)
-			cpm.taskChannels[priority] = taskCh
-			slog.Info("Dynamically created task channel", "priority", priority, "bufferSize", defaultBufferSize)
+			// For now, we only support ChannelTaskQueue
+			taskQueue = NewChannelTaskQueue(defaultBufferSize)
+			cpm.taskQueues[priority] = taskQueue
+			slog.Info("Dynamically created task queue (ChannelTaskQueue)", "priority", priority, "bufferSize", defaultBufferSize)
 
-			// Determine the number of consumers for the newly created channel
+			// Determine the number of consumers for the newly created queue
 			numConsumersToStart, ok := cpm.config.PriorityConsumers[priority]
 			if !ok || numConsumersToStart <= 0 {
 				numConsumersToStart = cpm.config.DefaultConsumers // Use default consumer count if not configured or invalid
@@ -94,10 +103,13 @@ func (cpm *ConsumerPoolManager) GetOrCreateChannel(priority int, taskIdentifier 
 
 			// Check if the maximum total number of consumer goroutines is exceeded
 			if atomic.LoadInt32(&cpm.currentConsumers)+int32(numConsumersToStart) > cpm.config.MaxTotalConsumers {
-				cpm.mu.Unlock()
-				delete(cpm.taskChannels, priority) // Delete the newly created channel
+				delete(cpm.taskQueues, priority) // Delete the newly created queue
+				// Close the queue that was just created before deleting it from the map
+				if closeErr := taskQueue.Close(); closeErr != nil {
+					slog.Error("Failed to close dynamically created queue after exceeding max total consumers", "priority", priority, "error", closeErr)
+				}
 				err := fmt.Errorf("max total consumers limit (%d) reached, cannot start %d consumers for priority %d", cpm.config.MaxTotalConsumers, numConsumersToStart, priority)
-				slog.Error("Failed to get or create channel", "identifier", taskIdentifier, "priority", priority, "error", err)
+				slog.Error("Failed to get or create queue", "identifier", taskIdentifier, "priority", priority, "error", err)
 				return nil, err
 			}
 
@@ -107,19 +119,19 @@ func (cpm *ConsumerPoolManager) GetOrCreateChannel(priority int, taskIdentifier 
 				atomic.AddInt32(&cpm.currentConsumers, 1) // Increase active consumer count
 				// Note: The TaskManager's startup context should be passed here, not the AddTask context
 				// Because the lifecycle of the consumer goroutine should be controlled by the TaskManager
-				go cpm.startConsumer(taskCh, processTask)
+				go cpm.startConsumer(taskQueue, processTask)
 			}
 		}
-		cpm.mu.Unlock()
+		// cpm.mu.Unlock() // Removed defer unlock, added explicit unlock or defer
 	}
 
-	return taskCh, nil
+	return taskQueue, nil
 }
 
 // startConsumer is the function executed by each consumer goroutine.
-// It continuously reads tasks from the specified task channel (taskCh) and distributes them to the processTaskFunc for processing.
+// It continuously reads tasks from the specified task queue (taskQueue) and distributes them to the processTaskFunc for processing.
 // Supports task timeout, cancellation, retry mechanisms, and includes panic recovery and limited restart logic.
-func (cpm *ConsumerPoolManager) startConsumer(taskCh <-chan Task, processTask processTaskFunc) {
+func (cpm *ConsumerPoolManager) startConsumer(taskQueue TaskQueue, processTask processTaskFunc) {
 	// Ensure that the WaitGroup is notified and the active consumer count is updated when the goroutine exits
 	defer cpm.wg.Done()
 	defer atomic.AddInt32(&cpm.currentConsumers, -1)
@@ -130,7 +142,7 @@ func (cpm *ConsumerPoolManager) startConsumer(taskCh <-chan Task, processTask pr
 	currentRestartDelay := initialRestartDelay
 
 	// The outer loop handles the restart of the goroutine.
-	// If the inner task processing loop exits due to panic or channel closure, the outer loop will attempt to restart.
+	// If the inner task processing loop exits due to panic or queue closure/error, the outer loop will attempt to restart.
 	for {
 		// Before each restart attempt, check if the TaskManager's context has been canceled.
 		// If the TaskManager is stopping, exit the entire goroutine.
@@ -159,8 +171,8 @@ func (cpm *ConsumerPoolManager) startConsumer(taskCh <-chan Task, processTask pr
 			}()
 
 			slog.Debug("Consumer goroutine started processing loop")
-			// Task processing loop: continuously receive tasks from the task channel until the channel is closed.
-			for task := range taskCh {
+			// Task processing loop: continuously receive tasks from the task queue until the queue is closed and empty.
+			for {
 				// Before processing each task, check again if the context is canceled.
 				// This allows for quick exit from task processing when the TaskManager is stopping.
 				select {
@@ -171,8 +183,22 @@ func (cpm *ConsumerPoolManager) startConsumer(taskCh <-chan Task, processTask pr
 					// TaskManager is not stopping, continue processing the current task.
 				}
 
+				task, err := taskQueue.Pop(cpm.ctx)
+				if err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						slog.Info("Consumer goroutine context canceled or deadline exceeded during Pop, exiting inner loop")
+						return // Context canceled, exit the inner function
+					}
+					// If the queue is closed and empty, Pop might return a specific error (e.g., io.EOF or a custom error).
+					// We need to handle this case to exit the loop gracefully.
+					// For ChannelTaskQueue, the range loop handles this, but with the interface, we check the error.
+					// Assuming a closed queue returns an error after processing all tasks.
+					slog.Info("Consumer goroutine received error from Pop, exiting inner loop", "error", err)
+					return // Exit the inner function on other errors from Pop
+				}
+
 				// Task dequeued, update queued count.
-				// Note: The TasksQueued metric should now be maintained by the TaskManager
+				// Note: The TasksQueued metric should now be maintained by the TaskManager or the TaskQueue implementation
 				// atomic.AddInt64(&m.metrics.TasksQueued, -1)
 
 				// Call the external task processing function
@@ -182,8 +208,8 @@ func (cpm *ConsumerPoolManager) startConsumer(taskCh <-chan Task, processTask pr
 				// atomic.AddInt64(&m.metrics.TasksProcessed, 1)
 				// atomic.AddInt64(&m.metrics.TasksFailed, 1)
 			}
-			slog.Info("Consumer goroutine task channel closed, exiting inner loop")
-			// If the channel is closed, the inner function exits normally.
+			// slog.Info("Consumer goroutine task channel closed, exiting inner loop") // This log might not be accurate anymore
+			// If the inner function exits (e.g., due to Pop error or context done), the outer loop will handle restart logic.
 		}() // End of inner anonymous function
 
 		// If the inner function exits (whether normally or after panic recovery),
@@ -194,7 +220,7 @@ func (cpm *ConsumerPoolManager) startConsumer(taskCh <-chan Task, processTask pr
 			return // TaskManager is stopping, exit the goroutine
 		default:
 			// The inner function exited, but the TaskManager is not stopping.
-			// This usually means a panic occurred or the channel was closed in a non-Stop state (exceptional case).
+			// This usually means a panic occurred or an unhandled error from Pop.
 			// Attempt to restart the goroutine.
 			restartAttempts++
 			if restartAttempts > maxRestartAttempts {
@@ -211,17 +237,20 @@ func (cpm *ConsumerPoolManager) startConsumer(taskCh <-chan Task, processTask pr
 	} // End of outer restart loop
 }
 
-// Stop gracefully stops all consumer goroutines and closes task channels.
+// Stop gracefully stops all consumer goroutines and closes task queues.
 func (cpm *ConsumerPoolManager) Stop() {
 	slog.Info("Stopping ConsumerPoolManager components...")
-	// Close all task channels
-	cpm.mu.Lock() // Lock to protect concurrent access to taskChannels
-	for priority, taskCh := range cpm.taskChannels {
-		close(taskCh)
-		slog.Info("Task channel closed", "priority", priority)
+	// Close all task queues
+	cpm.mu.Lock() // Lock to protect concurrent access to taskQueues
+	for priority, taskQueue := range cpm.taskQueues {
+		if err := taskQueue.Close(); err != nil {
+			slog.Error("Failed to close task queue", "priority", priority, "error", err)
+		} else {
+			slog.Info("Task queue closed", "priority", priority)
+		}
 	}
 	cpm.mu.Unlock()
-	slog.Info("All task channels closed")
+	slog.Info("All task queues closed")
 	// Wait for all consumer goroutines to complete their current tasks and exit
 	slog.Info("Waiting for consumers to finish...")
 	cpm.wg.Wait()

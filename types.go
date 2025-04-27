@@ -52,3 +52,19 @@ type PanicError struct {
 func (e PanicError) Error() string {
 	return fmt.Sprintf("task panicked: %v", e.Value)
 }
+
+// TaskQueue defines the interface for task storage and retrieval mechanisms.
+type TaskQueue interface {
+	// Push adds a task to the queue.
+	Push(task Task) error
+	// Pop retrieves a task from the queue, blocking until a task is available or the context is done.
+	Pop(ctx context.Context) (Task, error)
+	// Len returns the current number of tasks in the queue.
+	Len() int
+	// Close closes the queue, preventing further pushes and allowing existing tasks to be processed.
+	Close() error
+}
+
+// TaskQueueFactory defines a function type for creating TaskQueue instances.
+// It takes the priority and buffer size as input and returns a TaskQueue implementation and an error.
+type TaskQueueFactory func(priority int, bufferSize int) (TaskQueue, error)

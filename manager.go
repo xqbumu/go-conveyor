@@ -48,8 +48,16 @@ func NewManager(ctx context.Context, opts ...Option) (*Manager, error) {
 		config:         config,              // Store the final configuration
 	}
 
-	// Initialize ConsumerPoolManager, passing in relevant values from the final configuration
-	m.consumerPoolManager = NewConsumerPoolManager(ctx, &config.ConsumerPoolManagerConfig)
+	// Define a default TaskQueueFactory (using ChannelTaskQueue for now)
+	defaultTaskQueueFactory := func(priority int, bufferSize int) (TaskQueue, error) {
+		return NewChannelTaskQueue(bufferSize), nil
+	}
+
+	// Initialize ConsumerPoolManager, passing in relevant values from the final configuration and the task queue factory
+	m.consumerPoolManager = NewConsumerPoolManager(ctx, &config.ConsumerPoolManagerConfig, defaultTaskQueueFactory)
+	if m.consumerPoolManager == nil {
+		return nil, fmt.Errorf("failed to create consumer pool manager")
+	}
 
 	// Initialize ProducerManager, passing in the cron schedule, Produce timeout, and a function to get the workers
 	m.producerManager = NewProducerManager(
@@ -69,7 +77,8 @@ func NewManager(ctx context.Context, opts ...Option) (*Manager, error) {
 		"maxTotalConsumers", m.config.MaxTotalConsumers,
 		"producerCronSchedule", m.config.ProducerCronSchedule,
 		"produceTimeout", m.config.ProduceTimeout, // Add Produce timeout to the log
-		"retryOnPanic", m.config.RetryOnPanic)
+		"retryOnPanic", m.config.RetryOnPanic,
+		"taskQueueType", m.config.TaskQueueType) // Add task queue type to the log
 	return m, nil
 }
 
@@ -285,44 +294,24 @@ func (m *Manager) AddTask(ctx context.Context, id string, taskType Type, data an
 
 	slog.Debug("Attempting to add task to queue", "identifier", taskIdentifier, "priority", priority)
 
-	// 3. Get or create the corresponding channel through ConsumerPoolManager
-	// ConsumerPoolManager will be responsible for creating the channel and starting consumers
-	taskCh, err := m.consumerPoolManager.GetOrCreateChannel(priority, taskIdentifier, m.processTaskWithRetry)
+	// 3. Get or create the corresponding queue through ConsumerPoolManager
+	// ConsumerPoolManager will be responsible for creating the queue and starting consumers
+	taskQueue, err := m.consumerPoolManager.GetOrCreateQueue(priority, taskIdentifier, m.processTaskWithRetry)
 	if err != nil {
-		// GetOrCreateChannel failed, rollback state
+		// GetOrCreateQueue failed, rollback state
 		m.rollbackAddTask(taskIdentifier)
-		slog.Error("Failed to get or create task channel", "identifier", taskIdentifier, "priority", priority, "error", err)
+		slog.Error("Failed to get or create task queue", "identifier", taskIdentifier, "priority", priority, "error", err)
 		return err
 	}
 
-	// 4. Try to send the task to the channel
-	var sendErr error
-	// Use a flag to track whether the task was successfully sent
-	taskSent := false
+	// 4. Try to push the task to the queue
+	sendErr := taskQueue.Push(task)
+	taskSent := sendErr == nil // Task is sent if Push returns no error
 
-	// For high-priority tasks, try to send within 5 seconds, otherwise consider it timed out
-	if priority > 0 {
-		select {
-		case taskCh <- task:
-			slog.Info("High priority task added successfully", "identifier", taskIdentifier)
-			taskSent = true // Mark as sent
-		case <-time.After(5 * time.Second):
-			sendErr = fmt.Errorf("timeout adding high priority task %s", taskIdentifier)
-			slog.Error("Failed to add high priority task", "identifier", taskIdentifier, "error", sendErr)
-		case <-ctx.Done():
-			sendErr = fmt.Errorf("context canceled while adding high priority task %s: %w", taskIdentifier, ctx.Err())
-			slog.Warn("Context canceled while adding high priority task", "identifier", taskIdentifier, "error", ctx.Err())
-		}
+	if sendErr == nil {
+		slog.Info("Task added successfully", "identifier", taskIdentifier, "priority", priority)
 	} else {
-		// Normal priority tasks, block until successfully sent or context cancelled
-		select {
-		case taskCh <- task:
-			slog.Info("Normal priority task added successfully", "identifier", taskIdentifier)
-			taskSent = true // Mark as sent
-		case <-ctx.Done():
-			sendErr = fmt.Errorf("context canceled while adding normal priority task %s: %w", taskIdentifier, ctx.Err())
-			slog.Warn("Context canceled while adding normal priority task", "identifier", taskIdentifier, "error", ctx.Err())
-		}
+		slog.Error("Failed to push task to queue", "identifier", taskIdentifier, "priority", priority, "error", sendErr)
 	}
 
 	// If the task was not successfully sent, perform a rollback

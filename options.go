@@ -22,18 +22,46 @@ func NewConsumerPoolManagerConfig() ConsumerPoolManagerConfig {
 	}
 }
 
+// TaskQueueType defines the type of task queue to use.
+type TaskQueueType string
+
+const (
+	TaskQueueTypeChannel TaskQueueType = "channel"
+	// TODO: Add other task queue types like "redis", "database"
+)
+
 // ManagerConfig contains configuration options for the TaskManager.
 type ManagerConfig struct {
 	ConsumerPoolManagerConfig
 	ProducerCronSchedule string        // Cron schedule string for the producer to trigger the Produce method
 	ProduceTimeout       time.Duration // Timeout for the producer's Produce method (0 means no timeout)
 	RetryOnPanic         bool          // Whether to retry tasks when a Worker panics
+	TaskQueueType        TaskQueueType // Type of task queue to use (e.g., "channel", "redis", "database")
 }
+
+// NewManagerConfig creates a ManagerConfig instance with default configuration.
+// This function is not strictly necessary with the Option pattern, but can be useful for clarity.
+// func NewManagerConfig() ManagerConfig {
+// 	return ManagerConfig{
+// 		ConsumerPoolManagerConfig: NewConsumerPoolManagerConfig(),
+// 		ProducerCronSchedule:      "",
+// 		ProduceTimeout:            time.Minute,
+// 		RetryOnPanic:              false,
+// 		TaskQueueType:             TaskQueueTypeChannel, // Default to channel
+// 	}
+// }
 
 // WithRetryOnPanic configures whether to retry tasks when a Worker panics.
 func WithRetryOnPanic(retry bool) Option {
 	return func(cfg *ManagerConfig) {
 		cfg.RetryOnPanic = retry
+	}
+}
+
+// WithTaskQueueType configures the type of task queue to use.
+func WithTaskQueueType(queueType TaskQueueType) Option {
+	return func(cfg *ManagerConfig) {
+		cfg.TaskQueueType = queueType
 	}
 }
 
