@@ -29,9 +29,9 @@ func NewManager(ctx context.Context, opts ...Option) (*Manager, error) {
 	config := ManagerConfig{
 		ConsumerPoolManagerConfig: NewConsumerPoolManagerConfig(),
 
-		ProducerInterval: time.Minute, // Default producer interval
-		ProduceTimeout:   time.Minute, // Default producer Produce method timeout
-		RetryOnPanic:     false,       // Default to not retry on panic
+		ProducerCronSchedule: "",          // Default empty cron schedule (no cron trigger)
+		ProduceTimeout:       time.Minute, // Default producer Produce method timeout
+		RetryOnPanic:         false,       // Default to not retry on panic
 	}
 
 	// Apply the passed-in configuration options to the config struct
@@ -51,10 +51,10 @@ func NewManager(ctx context.Context, opts ...Option) (*Manager, error) {
 	// Initialize ConsumerPoolManager, passing in relevant values from the final configuration
 	m.consumerPoolManager = NewConsumerPoolManager(ctx, &config.ConsumerPoolManagerConfig)
 
-	// Initialize ProducerManager, passing in the producer interval, Produce timeout, and a function to get the workers
+	// Initialize ProducerManager, passing in the cron schedule, Produce timeout, and a function to get the workers
 	m.producerManager = NewProducerManager(
 		ctx, //	 Pass in the context for the ProducerManager
-		m.config.ProducerInterval,
+		m.config.ProducerCronSchedule,
 		m.config.ProduceTimeout, // Pass in the Produce timeout configuration
 		m.getWorkers,            // Pass in a method to get the list of workers
 	)
@@ -67,7 +67,7 @@ func NewManager(ctx context.Context, opts ...Option) (*Manager, error) {
 		"defaultConsumers", m.config.DefaultConsumers,
 		"maxPriorityChannels", m.config.MaxPriorityChannels,
 		"maxTotalConsumers", m.config.MaxTotalConsumers,
-		"producerInterval", m.config.ProducerInterval,
+		"producerCronSchedule", m.config.ProducerCronSchedule,
 		"produceTimeout", m.config.ProduceTimeout, // Add Produce timeout to the log
 		"retryOnPanic", m.config.RetryOnPanic)
 	return m, nil

@@ -43,8 +43,8 @@ func (w *FullWorker) Consume(ctx context.Context, task conveyor.Task) error {
 }
 
 // ProduceInterval returns the interval for calling the Produce method.
-func (w *FullWorker) ProduceInterval() (time.Duration, bool) {
-	return 2 * time.Second, true
+func (w *FullWorker) ProduceCronSchedule() (string, bool) {
+	return `*/1 * * * * *`, true
 }
 
 // Types returns the list of task types that the Worker can handle.
@@ -74,7 +74,7 @@ func ExampleNewManager_full() {
 	manager.AddTask(context.TODO(), "manual_task-2", "full_task", "Hello, Manual task 2!", 1, 0)
 	manager.AddTask(context.TODO(), "manual_task-3", "full_task", "Hello, Manual task 3!", 0, 0)
 
-	time.Sleep(3 * time.Second)
+	time.Sleep(1500 * time.Millisecond)
 	cancel()
 	time.Sleep(200 * time.Millisecond)
 

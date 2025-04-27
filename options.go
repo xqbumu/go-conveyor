@@ -25,9 +25,9 @@ func NewConsumerPoolManagerConfig() ConsumerPoolManagerConfig {
 // ManagerConfig contains configuration options for the TaskManager.
 type ManagerConfig struct {
 	ConsumerPoolManagerConfig
-	ProducerInterval time.Duration // Time interval for the producer to trigger the Produce method
-	ProduceTimeout   time.Duration // Timeout for the producer's Produce method (0 means no timeout)
-	RetryOnPanic     bool          // Whether to retry tasks when a Worker panics
+	ProducerCronSchedule string        // Cron schedule string for the producer to trigger the Produce method
+	ProduceTimeout       time.Duration // Timeout for the producer's Produce method (0 means no timeout)
+	RetryOnPanic         bool          // Whether to retry tasks when a Worker panics
 }
 
 // WithRetryOnPanic configures whether to retry tasks when a Worker panics.
@@ -82,10 +82,10 @@ func WithPriorityConsumers(config map[int]int) Option {
 	}
 }
 
-// WithProducerInterval configures the time interval for the producer to trigger the Produce method.
-func WithProducerInterval(interval time.Duration) Option {
+// WithProducerCronSchedule configures the cron schedule string for the producer to trigger the Produce method.
+func WithProducerCronSchedule(schedule string) Option {
 	return func(cfg *ManagerConfig) {
-		cfg.ProducerInterval = interval
+		cfg.ProducerCronSchedule = schedule
 	}
 }
 

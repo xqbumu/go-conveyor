@@ -19,10 +19,12 @@ type Worker interface {
 	Types(ctx context.Context) []Type
 }
 
-type WorkerProduceInterval interface {
-	// ProduceInterval returns the desired interval for calling the Produce method.
-	// If the returned duration is zero or the boolean is false, the global interval will be used.
-	ProduceInterval() (time.Duration, bool)
+// WorkerProduceCronSchedule is an optional interface that Workers can implement
+// to specify a cron schedule for their Produce method.
+type WorkerProduceCronSchedule interface {
+	// ProduceCronSchedule returns the desired cron schedule string for calling the Produce method.
+	// If the returned string is empty or the boolean is false, the global cron schedule will be used.
+	ProduceCronSchedule() (string, bool)
 }
 
 // Type defines the type of task, using a string for easy extension.
