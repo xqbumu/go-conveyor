@@ -41,6 +41,11 @@ go get github.com/xqbumu/go-conveyor
 
 ### 示例
 
+以下是一些示例，帮助您快速入门：
+
+*   [简单工作者示例](_examples/simple_worker_test.go)
+*   [README 工作者示例](_examples/readme_worker_test.go)
+*   [故障工作者示例](_examples/faulty_worker_test.go)
 
 ## 贡献
 

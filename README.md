@@ -41,6 +41,12 @@ go get github.com/xqbumu/go-conveyor
 
 ### Example
 
+Here are some examples to get you started:
+
+*   [Simple Worker Example](_examples/simple_worker_test.go)
+*   [README Worker Example](_examples/readme_worker_test.go)
+*   [Faulty Worker Example](_examples/faulty_worker_test.go)
+
 ## Contributing
 
 We welcome issues and pull requests. Feel free to contribute to the project.
