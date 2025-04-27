@@ -48,14 +48,21 @@ func NewManager(ctx context.Context, opts ...Option) (*Manager, error) {
 		config:         config,              // Store the final configuration
 	}
 
-	// Define a default TaskQueueFactory (using ChannelTaskQueue for now)
-	defaultTaskQueueFactory := func(priority int, bufferSize int) (TaskQueue, error) {
-		return NewChannelTaskQueue(bufferSize), nil
+	// Use the provided TaskQueueFactory if available, otherwise use the default channel factory.
+	taskQueueFactory := config.TaskQueueFactory
+	if taskQueueFactory == nil {
+		slog.Info("No TaskQueueFactory provided, using default channel implementation.")
+		taskQueueFactory = func(priority int, bufferSize int) (TaskQueue, error) {
+			return NewChannelTaskQueue(bufferSize), nil
+		}
 	}
 
 	// Initialize ConsumerPoolManager, passing in relevant values from the final configuration and the task queue factory
-	m.consumerPoolManager = NewConsumerPoolManager(ctx, &config.ConsumerPoolManagerConfig, defaultTaskQueueFactory)
+	m.consumerPoolManager = NewConsumerPoolManager(ctx, &config.ConsumerPoolManagerConfig, taskQueueFactory)
 	if m.consumerPoolManager == nil {
+		// If consumer pool manager creation fails, and we created a Redis client, close it.
+		// This is a simplified approach; proper client lifecycle management might be needed.
+		// For now, rely on TaskQueue.Close() called in Manager.Stop().
 		return nil, fmt.Errorf("failed to create consumer pool manager")
 	}
 
@@ -77,8 +84,7 @@ func NewManager(ctx context.Context, opts ...Option) (*Manager, error) {
 		"maxTotalConsumers", m.config.MaxTotalConsumers,
 		"producerCronSchedule", m.config.ProducerCronSchedule,
 		"produceTimeout", m.config.ProduceTimeout, // Add Produce timeout to the log
-		"retryOnPanic", m.config.RetryOnPanic,
-		"taskQueueType", m.config.TaskQueueType) // Add task queue type to the log
+		"retryOnPanic", m.config.RetryOnPanic)
 	return m, nil
 }
 
