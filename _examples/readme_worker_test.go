@@ -3,6 +3,7 @@ package _examples
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync/atomic"
 	"time"
 
@@ -32,13 +33,17 @@ func (w *ReadmeWorker) Produce(ctx context.Context) error {
 func (w *ReadmeWorker) Consume(ctx context.Context, task conveyor.Task) error {
 	select {
 	case <-ctx.Done():
-		fmt.Printf("Task %s (Type: %s) cancelled or timed out\n", task.ID, task.Type)
+		log.Printf("Task %s (Type: %s) cancelled or timed out\n", task.ID, task.Type)
 		return ctx.Err()
 	default:
-		fmt.Printf("Processing task %s (Type: %s, Priority: %d, Data: %v)\n", task.ID, task.Type, task.Priority, task.Data)
+		log.Printf("Processing task %s (Type: %s, Priority: %d, Data: %v)\n", task.ID, task.Type, task.Priority, task.Data)
 		time.Sleep(50 * time.Millisecond)
 		return nil
 	}
+}
+
+func (w *ReadmeWorker) ProduceInterval() (time.Duration, bool) {
+	return 2 * time.Second, true
 }
 
 func (w *ReadmeWorker) Types(ctx context.Context) []conveyor.Type {
@@ -55,7 +60,7 @@ func ExampleNewManager_readme() {
 		conveyor.WithMaxTotalConsumers(5),
 	)
 	if err != nil {
-		fmt.Printf("Failed to create TaskManager: %v\n", err)
+		log.Printf("Failed to create TaskManager: %v\n", err)
 		return
 	}
 
@@ -63,16 +68,16 @@ func ExampleNewManager_readme() {
 
 	go manager.Start()
 
-	// manager.AddTask(context.TODO(), "manual_task-1", "readme_task", "Hello, Manual task 1!", 0, 0)
-	// manager.AddTask(context.TODO(), "manual_task-2", "readme_task", "Hello, Manual task 2!", 1, 0)
-	// manager.AddTask(context.TODO(), "manual_task-3", "readme_task", "Hello, Manual task 3!", 0, 0)
+	manager.AddTask(context.TODO(), "manual_task-1", "readme_task", "Hello, Manual task 1!", 0, 0)
+	manager.AddTask(context.TODO(), "manual_task-2", "readme_task", "Hello, Manual task 2!", 1, 0)
+	manager.AddTask(context.TODO(), "manual_task-3", "readme_task", "Hello, Manual task 3!", 0, 0)
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(3 * time.Second)
 	cancel()
 	time.Sleep(200 * time.Millisecond)
 
 	fmt.Printf("Metrics: %+v\n", manager.GetMetrics())
 
 	// Output:
-	// Metrics: {TasksQueued:0 TasksProcessed:6 TasksFailed:0 WorkersActive:0}
+	// Metrics: {TasksQueued:0 TasksProcessed:5 TasksFailed:0 WorkersActive:0}
 }

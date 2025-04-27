@@ -19,6 +19,12 @@ type Worker interface {
 	Types(ctx context.Context) []Type
 }
 
+type WorkerProduceInterval interface {
+	// ProduceInterval returns the desired interval for calling the Produce method.
+	// If the returned duration is zero or the boolean is false, the global interval will be used.
+	ProduceInterval() (time.Duration, bool)
+}
+
 // Type defines the type of task, using a string for easy extension.
 type Type string
 
