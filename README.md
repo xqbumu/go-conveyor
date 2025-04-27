@@ -14,20 +14,23 @@
 
 ## Introduction
 
-`go-conveyor` is a task management system written in Go, designed to simplify task production, scheduling, and execution. Key features include:
+`go-conveyor` is a task management system written in Go, designed to simplify task production, scheduling, and execution. The core component is the `Manager`, which orchestrates the entire process. Key features include:
 
-* **Consumer Pool Management**: Efficiently processes tasks concurrently using goroutine pools.
-* **Producer Management**: Produces tasks on a schedule with customizable logic.
-* **Task Set Management**: Automatically deduplicates tasks to prevent redundant execution.
+* **Consumer Pool Management**: Efficiently processes tasks concurrently using goroutine pools, supporting task prioritization.
+* **Producer Management**: Produces tasks on a schedule by triggering the `Produce` method of registered workers.
+* **Task Set Management**: Automatically deduplicates tasks to prevent redundant execution and handles periodic cleanup.
 
 ## Features
 
-* **Task Production**: Producers trigger the `Produce` method of workers to generate tasks.
-* **Task Scheduling**: The consumer pool manager distributes tasks to different channels based on priority.
-* **Task Execution**: Consumer goroutines read and execute tasks from channels.
-* **Task Deduplication**: Automatically prevents duplicate task execution.
-* **Task Retry**: Supports retrying tasks after execution failures.
-* **Task Timeout**: Provides control over task execution timeouts.
+* **Task Production**: Producers trigger the `Produce` method of registered workers to generate tasks periodically.
+* **Task Scheduling**: The `ConsumerPoolManager` distributes tasks to different channels based on priority, managing goroutine pools for concurrent execution.
+* **Task Execution**: Consumer goroutines read tasks from priority channels and execute them by calling the `Consume` method of the corresponding worker.
+* **Task Deduplication**: The `TaskSetManager` automatically prevents duplicate task execution by tracking tasks that are currently queued or being processed.
+* **Task Retry**: Supports configurable retrying of tasks after execution failures, including handling panics based on configuration (`RetryOnPanic`).
+* **Task Timeout**: Provides control over individual task execution timeouts.
+* **Graceful Shutdown**: The `Manager` supports graceful stopping, ensuring all components and running tasks are properly shut down.
+* **Metrics**: Provides basic metrics on tasks queued, processed, failed, and active workers.
+* **Configuration**: Allows customization of consumer pool sizes, producer intervals, task timeouts, and retry behavior via `ManagerConfig` and options.
 
 ## Installation
 
