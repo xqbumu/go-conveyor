@@ -51,12 +51,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/xqbumu/go-conveyor/task"
+	"github.com/xqbumu/go-conveyor"
 )
 
 func main() {
 	// Create a TaskManager instance
-	tm := task.NewTaskManager()
+	tm := conveyor.NewTaskManager()
 
 	// Register a Worker
 	tm.RegisterWorker("example_worker", &ExampleWorker{})
@@ -66,7 +66,7 @@ func main() {
 	tm.Start(ctx)
 
 	// Add a task
-	tm.AddTask(ctx, "example_worker", task.Task{
+	tm.AddTask(ctx, "example_worker", conveyor.Task{
 		ID:   "1",
 		Type: "example_task",
 		Data: map[string]interface{}{
@@ -88,9 +88,9 @@ func (w *ExampleWorker) Produce(ctx context.Context) error {
 	return nil
 }
 
-func (w *ExampleWorker) Process(ctx context.Context, task task.Task) error {
+func (w *ExampleWorker) Process(ctx context.Context, task conveyor.Task) error {
 	// Logic for processing tasks
-	fmt.Println(task.Data["message"])
+	fmt.Println(conveyor.Data["message"])
 	return nil
 }
 ```

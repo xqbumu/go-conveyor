@@ -3,14 +3,14 @@
 ## 目录
 
 - [go-conveyor](#go-conveyor)
-  - [目录](#目录)
-  - [简介](#简介)
-  - [功能](#功能)
-  - [安装](#安装)
-  - [使用方法](#使用方法)
-    - [示例](#示例)
-  - [贡献](#贡献)
-  - [许可证](#许可证)
+	- [目录](#目录)
+	- [简介](#简介)
+	- [功能](#功能)
+	- [安装](#安装)
+	- [使用方法](#使用方法)
+		- [示例](#示例)
+	- [贡献](#贡献)
+	- [许可证](#许可证)
 
 ## 简介
 
@@ -51,12 +51,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/xqbumu/go-conveyor/task"
+	"github.com/xqbumu/go-conveyor"
 )
 
 func main() {
 	// 创建一个 TaskManager 实例
-	tm := task.NewTaskManager()
+	tm := conveyor.NewTaskManager()
 
 	// 注册一个 Worker
 	tm.RegisterWorker("example_worker", &ExampleWorker{})
@@ -66,7 +66,7 @@ func main() {
 	tm.Start(ctx)
 
 	// 添加一个任务
-	tm.AddTask(ctx, "example_worker", task.Task{
+	tm.AddTask(ctx, "example_worker", conveyor.Task{
 		ID:   "1",
 		Type: "example_task",
 		Data: map[string]interface{}{
@@ -88,9 +88,9 @@ func (w *ExampleWorker) Produce(ctx context.Context) error {
 	return nil
 }
 
-func (w *ExampleWorker) Process(ctx context.Context, task task.Task) error {
+func (w *ExampleWorker) Process(ctx context.Context, task conveyor.Task) error {
 	// 处理任务的逻辑
-	fmt.Println(task.Data["message"])
+	fmt.Println(conveyor.Data["message"])
 	return nil
 }
 ```
