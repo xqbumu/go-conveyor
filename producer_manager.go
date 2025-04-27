@@ -12,22 +12,24 @@ type GetWorkersFunc func() []Worker
 
 // ProducerManager is responsible for managing producer timers and triggering the Produce method of Workers.
 type ProducerManager struct {
-	ticker         *time.Ticker   // Timer for triggering the Produce method of Workers
-	getWorkers     GetWorkersFunc // Function for obtaining the list of registered Workers
-	wg             sync.WaitGroup // WaitGroup for waiting for the producer goroutine to finish
-	interval       time.Duration  // Interval for triggering the Produce method of Workers
-	produceTimeout time.Duration  // Timeout for the Produce method of Workers
+	ctx            context.Context // Context for managing cancellation and timeouts
+	ticker         *time.Ticker    // Timer for triggering the Produce method of Workers
+	getWorkers     GetWorkersFunc  // Function for obtaining the list of registered Workers
+	wg             sync.WaitGroup  // WaitGroup for waiting for the producer goroutine to finish
+	interval       time.Duration   // Interval for triggering the Produce method of Workers
+	produceTimeout time.Duration   // Timeout for the Produce method of Workers
 }
 
 // NewProducerManager creates and initializes a new ProducerManager instance.
-func NewProducerManager(interval time.Duration, produceTimeout time.Duration, getWorkers GetWorkersFunc) *ProducerManager {
+func NewProducerManager(ctx context.Context, interval time.Duration, produceTimeout time.Duration, getWorkers GetWorkersFunc) *ProducerManager {
 	if getWorkers == nil {
 		slog.Error("NewProducerManager requires a non-nil GetWorkersFunc")
 		// In a real application, you might want to return an error or panic
 		return nil
 	}
 	pm := &ProducerManager{
-		getWorkers:     getWorkers,
+		ctx:            ctx,            // Store context
+		getWorkers:     getWorkers,     // Store function to get Workers
 		interval:       interval,       // Store interval
 		produceTimeout: produceTimeout, // Store Produce timeout
 	}
@@ -37,7 +39,7 @@ func NewProducerManager(interval time.Duration, produceTimeout time.Duration, ge
 
 // Start starts the producer timer goroutine.
 // This method will block until the provided context ctx is canceled.
-func (pm *ProducerManager) Start(ctx context.Context) {
+func (pm *ProducerManager) Start() {
 	slog.Info("Starting producer ticker", "interval", pm.interval)
 
 	pm.ticker = time.NewTicker(pm.interval)
@@ -55,7 +57,7 @@ func (pm *ProducerManager) Start(ctx context.Context) {
 				// Iterate and call the Produce method of each Worker
 				for _, worker := range workers {
 					// Create a separate context with timeout for the Produce method
-					produceCtx, produceCancel := context.WithTimeout(ctx, pm.produceTimeout)
+					produceCtx, produceCancel := context.WithTimeout(pm.ctx, pm.produceTimeout)
 
 					if err := worker.Produce(produceCtx); err != nil {
 						// Log production error, but do not interrupt the loop
@@ -63,7 +65,7 @@ func (pm *ProducerManager) Start(ctx context.Context) {
 					}
 					produceCancel() // Cancel the context for the Produce method
 				}
-			case <-ctx.Done(): // External context canceled
+			case <-pm.ctx.Done(): // External context canceled
 				return // Exit goroutine
 			}
 		}

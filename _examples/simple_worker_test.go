@@ -40,8 +40,12 @@ func (w *SimpleWorker) Types(ctx context.Context) []conveyor.Type {
 
 // ExampleNewManager demonstrates how to create and use TaskManager.
 func ExampleNewManager_simple() {
+	// Create a context to control the lifecycle of the TaskManager.
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Create a TaskManager with configuration options.
 	manager, err := conveyor.NewManager(
+		ctx,
 		conveyor.WithDefaultBufferSize(20),
 		conveyor.WithDefaultConsumers(5),
 		conveyor.WithMaxTotalConsumers(20),
@@ -57,11 +61,8 @@ func ExampleNewManager_simple() {
 	simpleWorker := &SimpleWorker{}
 	manager.Register(simpleWorker)
 
-	// Create a context to control the lifecycle of the TaskManager.
-	ctx, cancel := context.WithCancel(context.Background())
-
 	// Start the TaskManager in a goroutine.
-	go manager.Start(ctx)
+	go manager.Start()
 
 	// Wait for the TaskManager to start (optional, ensure channels are ready).
 	time.Sleep(100 * time.Millisecond)

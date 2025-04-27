@@ -41,59 +41,6 @@ go get github.com/xqbumu/go-conveyor
 
 ### 示例
 
-以下是一个演示如何使用 `go-conveyor` 的示例：
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/xqbumu/go-conveyor"
-)
-
-func main() {
-	// 创建一个 TaskManager 实例
-	tm := conveyor.NewTaskManager()
-
-	// 注册一个 Worker
-	tm.RegisterWorker("example_worker", &ExampleWorker{})
-
-	// 启动 TaskManager
-	ctx := context.Background()
-	tm.Start(ctx)
-
-	// 添加一个任务
-	tm.AddTask(ctx, "example_worker", conveyor.Task{
-		ID:   "1",
-		Type: "example_task",
-		Data: map[string]interface{}{
-			"message": "Hello, world!",
-		},
-	})
-
-	// 等待一段时间
-	time.Sleep(5 * time.Second)
-
-	// 停止 TaskManager
-	tm.Stop()
-}
-
-type ExampleWorker struct{}
-
-func (w *ExampleWorker) Produce(ctx context.Context) error {
-	// 生成任务的逻辑
-	return nil
-}
-
-func (w *ExampleWorker) Process(ctx context.Context, task conveyor.Task) error {
-	// 处理任务的逻辑
-	fmt.Println(conveyor.Data["message"])
-	return nil
-}
-```
 
 ## 贡献
 

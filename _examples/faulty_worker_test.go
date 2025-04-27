@@ -84,8 +84,12 @@ func (w *FaultyWorker) Types(ctx context.Context) []conveyor.Type {
 
 // ExampleNewManager_faulty tests the panic recovery and retry logic of TaskManager
 func ExampleNewManager_faulty() {
+	// Create a context to control the lifecycle of TaskManager
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Create TaskManager with a smaller buffer size and number of consumers to observe behavior
 	manager, err := conveyor.NewManager(
+		ctx,
 		conveyor.WithDefaultBufferSize(5),
 		conveyor.WithDefaultConsumers(2),
 		conveyor.WithMaxTotalConsumers(5),
@@ -99,11 +103,8 @@ func ExampleNewManager_faulty() {
 	faultyWorker := NewFaultyWorker() // Create an instance using the constructor
 	manager.Register(faultyWorker)
 
-	// Create a context to control the lifecycle of TaskManager
-	ctx, cancel := context.WithCancel(context.Background())
-
 	// Start TaskManager in a goroutine
-	go manager.Start(ctx)
+	go manager.Start()
 
 	// Wait for TaskManager to start
 	time.Sleep(100 * time.Millisecond)

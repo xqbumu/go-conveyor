@@ -1,17 +1,33 @@
 package conveyor
 
-import "time"
+import (
+	"time"
+)
+
+type ConsumerPoolManagerConfig struct {
+	MaxPriorityChannels int32       // Maximum number of priority channels that can be dynamically created
+	MaxTotalConsumers   int32       // Maximum total number of consumer goroutines allowed
+	DefaultConsumers    int         // Default number of consumer goroutines
+	DefaultBufferSize   int         // Default task channel buffer size
+	PriorityConsumers   map[int]int // Configuration of the number of consumers for specific priority task channels
+}
+
+func NewConsumerPoolManagerConfig() ConsumerPoolManagerConfig {
+	return ConsumerPoolManagerConfig{
+		MaxPriorityChannels: 10,
+		MaxTotalConsumers:   10,
+		DefaultConsumers:    1,
+		DefaultBufferSize:   10,
+		PriorityConsumers:   make(map[int]int),
+	}
+}
 
 // ManagerConfig contains configuration options for the TaskManager.
 type ManagerConfig struct {
-	MaxPriorityChannels int32         // Maximum number of priority channels that can be dynamically created
-	MaxTotalConsumers   int32         // Maximum total number of consumer goroutines allowed
-	DefaultConsumers    int           // Default number of consumer goroutines
-	DefaultBufferSize   int           // Default task channel buffer size
-	PriorityConsumers   map[int]int   // Configuration of the number of consumers for specific priority task channels
-	ProducerInterval    time.Duration // Time interval for the producer to trigger the Produce method
-	ProduceTimeout      time.Duration // Timeout for the producer's Produce method (0 means no timeout)
-	RetryOnPanic        bool          // Whether to retry tasks when a Worker panics
+	ConsumerPoolManagerConfig
+	ProducerInterval time.Duration // Time interval for the producer to trigger the Produce method
+	ProduceTimeout   time.Duration // Timeout for the producer's Produce method (0 means no timeout)
+	RetryOnPanic     bool          // Whether to retry tasks when a Worker panics
 }
 
 // WithRetryOnPanic configures whether to retry tasks when a Worker panics.

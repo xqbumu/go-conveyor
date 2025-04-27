@@ -41,60 +41,6 @@ go get github.com/xqbumu/go-conveyor
 
 ### Example
 
-Below is an example demonstrating how to use `go-conveyor`:
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/xqbumu/go-conveyor"
-)
-
-func main() {
-	// Create a TaskManager instance
-	tm := conveyor.NewTaskManager()
-
-	// Register a Worker
-	tm.RegisterWorker("example_worker", &ExampleWorker{})
-
-	// Start the TaskManager
-	ctx := context.Background()
-	tm.Start(ctx)
-
-	// Add a task
-	tm.AddTask(ctx, "example_worker", conveyor.Task{
-		ID:   "1",
-		Type: "example_task",
-		Data: map[string]interface{}{
-			"message": "Hello, world!",
-		},
-	})
-
-	// Wait for a while
-	time.Sleep(5 * time.Second)
-
-	// Stop the TaskManager
-	tm.Stop()
-}
-
-type ExampleWorker struct{}
-
-func (w *ExampleWorker) Produce(ctx context.Context) error {
-	// Logic for producing tasks
-	return nil
-}
-
-func (w *ExampleWorker) Process(ctx context.Context, task conveyor.Task) error {
-	// Logic for processing tasks
-	fmt.Println(conveyor.Data["message"])
-	return nil
-}
-```
-
 ## Contributing
 
 We welcome issues and pull requests. Feel free to contribute to the project.

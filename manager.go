@@ -11,6 +11,7 @@ import (
 
 // Manager is the task manager responsible for receiving, scheduling, and processing tasks.
 type Manager struct {
+	ctx                 context.Context      // Context for managing cancellation and timeouts
 	workers             []Worker             // List of all registered Worker instances
 	workerMap           map[Type]Worker      // Mapping from task type to corresponding Worker for quick lookup
 	metrics             Metrics              // Metrics for the task manager's operation
@@ -21,51 +22,16 @@ type Manager struct {
 	config              ManagerConfig        // Configuration for the Manager
 }
 
-// rollbackAddTask is a helper function to clean up state before a task fails to send to the channel.
-func (m *Manager) rollbackAddTask(taskIdentifier string) {
-	atomic.AddInt64(&m.metrics.TasksQueued, -1) // Rollback queued count
-	m.taskSetManager.Remove(taskIdentifier)     // Remove from taskSetManager
-	slog.Warn("Task addition failed or was cancelled before sending, rolled back state", "identifier", taskIdentifier)
-}
-
-// PanicError wraps a panic value to be returned as an error.
-type PanicError struct {
-	Value any
-}
-
-func (e PanicError) Error() string {
-	return fmt.Sprintf("task panicked: %v", e.Value)
-}
-
-// executeTaskConsume is a helper function to execute worker.Consume and recover from panic.
-func (m *Manager) executeTaskConsume(ctx context.Context, worker Worker, task Task) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			// Recover from panic
-			err = PanicError{Value: r} // Wrap the panic value in a custom error
-			slog.Error("Task panicked during execution",
-				"taskID", task.ID,
-				"type", task.Type,
-				"panic", r)
-		}
-	}()
-	// Call the actual worker Consume method
-	return worker.Consume(ctx, task)
-}
-
 // NewManager creates and initializes a new TaskManager instance
 // using the WithOption pattern to pass in configuration.
-func NewManager(opts ...Option) (*Manager, error) {
+func NewManager(ctx context.Context, opts ...Option) (*Manager, error) {
 	// Create a ManagerConfig instance with default configuration
 	config := ManagerConfig{
-		MaxPriorityChannels: int32(10),
-		MaxTotalConsumers:   int32(100),
-		DefaultConsumers:    10,
-		DefaultBufferSize:   1000,
-		PriorityConsumers:   make(map[int]int),
-		ProducerInterval:    time.Minute, // Default producer interval
-		ProduceTimeout:      time.Minute, // Default producer Produce method timeout
-		RetryOnPanic:        false,       // Default to not retry on panic
+		ConsumerPoolManagerConfig: NewConsumerPoolManagerConfig(),
+
+		ProducerInterval: time.Minute, // Default producer interval
+		ProduceTimeout:   time.Minute, // Default producer Produce method timeout
+		RetryOnPanic:     false,       // Default to not retry on panic
 	}
 
 	// Apply the passed-in configuration options to the config struct
@@ -75,6 +41,7 @@ func NewManager(opts ...Option) (*Manager, error) {
 
 	// Initialize the TaskManager instance
 	m := &Manager{
+		ctx:            ctx,
 		workers:        make([]Worker, 0),
 		workerMap:      make(map[Type]Worker),
 		taskSetManager: NewTaskSetManager(), // Initialize TaskSetManager
@@ -82,16 +49,11 @@ func NewManager(opts ...Option) (*Manager, error) {
 	}
 
 	// Initialize ConsumerPoolManager, passing in relevant values from the final configuration
-	m.consumerPoolManager = NewConsumerPoolManager(
-		m.config.MaxPriorityChannels,
-		m.config.MaxTotalConsumers,
-		m.config.DefaultConsumers,
-		m.config.DefaultBufferSize,
-		m.config.PriorityConsumers,
-	)
+	m.consumerPoolManager = NewConsumerPoolManager(ctx, &config.ConsumerPoolManagerConfig)
 
 	// Initialize ProducerManager, passing in the producer interval, Produce timeout, and a function to get the workers
 	m.producerManager = NewProducerManager(
+		ctx, //	 Pass in the context for the ProducerManager
 		m.config.ProducerInterval,
 		m.config.ProduceTimeout, // Pass in the Produce timeout configuration
 		m.getWorkers,            // Pass in a method to get the list of workers
@@ -114,23 +76,45 @@ func NewManager(opts ...Option) (*Manager, error) {
 // Start starts the task manager
 // This method blocks until the passed-in context ctx is cancelled
 // It starts the consumer goroutines and the periodic producer goroutine
-func (m *Manager) Start(ctx context.Context) {
+func (m *Manager) Start() {
 	slog.Info("Starting TaskManager...")
 
 	// Start the consumer goroutine pool for the default priority (0), delegated to ConsumerPoolManager
 	// Pass in the processTaskWithRetry function as the task processing logic
-	m.consumerPoolManager.ctx = ctx
-	m.consumerPoolManager.StartDefaultConsumers(ctx, m.processTaskWithRetry)
+	m.consumerPoolManager.StartDefaultConsumers(m.processTaskWithRetry)
 
 	// Start the ProducerManager
 	slog.Info("Starting ProducerManager...")
-	m.producerManager.Start(ctx)
+	m.producerManager.Start()
 
 	// Block and wait for the external context ctx to be cancelled
-	<-ctx.Done()
+	<-m.ctx.Done()
 	slog.Info("TaskManager received stop signal, shutting down...")
 	m.Stop() // Call the Stop method for cleanup
 	slog.Info("TaskManager stopped gracefully")
+}
+
+// rollbackAddTask is a helper function to clean up state before a task fails to send to the channel.
+func (m *Manager) rollbackAddTask(taskIdentifier string) {
+	atomic.AddInt64(&m.metrics.TasksQueued, -1) // Rollback queued count
+	m.taskSetManager.Remove(taskIdentifier)     // Remove from taskSetManager
+	slog.Warn("Task addition failed or was cancelled before sending, rolled back state", "identifier", taskIdentifier)
+}
+
+// executeTaskConsume is a helper function to execute worker.Consume and recover from panic.
+func (m *Manager) executeTaskConsume(taskCtx context.Context, worker Worker, task Task) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Recover from panic
+			err = PanicError{Value: r} // Wrap the panic value in a custom error
+			slog.Error("Task panicked during execution",
+				"taskID", task.ID,
+				"type", task.Type,
+				"panic", r)
+		}
+	}()
+	// Call the actual worker Consume method
+	return worker.Consume(taskCtx, task)
 }
 
 // Stop gracefully stops the task manager
@@ -303,7 +287,7 @@ func (m *Manager) AddTask(ctx context.Context, id string, taskType Type, data an
 
 	// 3. Get or create the corresponding channel through ConsumerPoolManager
 	// ConsumerPoolManager will be responsible for creating the channel and starting consumers
-	taskCh, err := m.consumerPoolManager.GetOrCreateChannel(ctx, priority, taskIdentifier, m.processTaskWithRetry)
+	taskCh, err := m.consumerPoolManager.GetOrCreateChannel(priority, taskIdentifier, m.processTaskWithRetry)
 	if err != nil {
 		// GetOrCreateChannel failed, rollback state
 		m.rollbackAddTask(taskIdentifier)

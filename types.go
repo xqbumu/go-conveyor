@@ -35,3 +35,12 @@ type Task struct {
 func (t Task) Identify() string {
 	return fmt.Sprintf("%s:%s", t.ID, t.Type)
 }
+
+// PanicError wraps a panic value to be returned as an error.
+type PanicError struct {
+	Value any
+}
+
+func (e PanicError) Error() string {
+	return fmt.Sprintf("task panicked: %v", e.Value)
+}
