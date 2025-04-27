@@ -10,19 +10,19 @@ import (
 	"github.com/xqbumu/go-conveyor"
 )
 
-// ReadmeWorker is a simple implementation of the Worker interface.
-type ReadmeWorker struct {
+// FullWorker is a simple implementation of the Worker interface.
+type FullWorker struct {
 	manager *conveyor.Manager
 	index   atomic.Int32
 }
 
 // Produce implements the Produce method of the Worker interface.
-func (w *ReadmeWorker) Produce(ctx context.Context) error {
+func (w *FullWorker) Produce(ctx context.Context) error {
 	w.index.Add(1)
 	return w.manager.AddTask(
 		ctx,
 		fmt.Sprintf("auto_task-%d", w.index),
-		"readme_task",
+		"full_task",
 		fmt.Sprintf("Hello, Auto task %d!", w.index),
 		0,
 		0,
@@ -30,7 +30,7 @@ func (w *ReadmeWorker) Produce(ctx context.Context) error {
 }
 
 // Consume implements the Consume method of the Worker interface.
-func (w *ReadmeWorker) Consume(ctx context.Context, task conveyor.Task) error {
+func (w *FullWorker) Consume(ctx context.Context, task conveyor.Task) error {
 	select {
 	case <-ctx.Done():
 		log.Printf("Task %s (Type: %s) cancelled or timed out\n", task.ID, task.Type)
@@ -42,15 +42,17 @@ func (w *ReadmeWorker) Consume(ctx context.Context, task conveyor.Task) error {
 	}
 }
 
-func (w *ReadmeWorker) ProduceInterval() (time.Duration, bool) {
+// ProduceInterval returns the interval for calling the Produce method.
+func (w *FullWorker) ProduceInterval() (time.Duration, bool) {
 	return 2 * time.Second, true
 }
 
-func (w *ReadmeWorker) Types(ctx context.Context) []conveyor.Type {
-	return []conveyor.Type{"readme_task"}
+// Types returns the list of task types that the Worker can handle.
+func (w *FullWorker) Types(ctx context.Context) []conveyor.Type {
+	return []conveyor.Type{"full_task"}
 }
 
-func ExampleNewManager_readme() {
+func ExampleNewManager_full() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	manager, err := conveyor.NewManager(
@@ -64,13 +66,13 @@ func ExampleNewManager_readme() {
 		return
 	}
 
-	manager.Register(&ReadmeWorker{manager: manager, index: atomic.Int32{}})
+	manager.Register(&FullWorker{manager: manager, index: atomic.Int32{}})
 
 	go manager.Start()
 
-	manager.AddTask(context.TODO(), "manual_task-1", "readme_task", "Hello, Manual task 1!", 0, 0)
-	manager.AddTask(context.TODO(), "manual_task-2", "readme_task", "Hello, Manual task 2!", 1, 0)
-	manager.AddTask(context.TODO(), "manual_task-3", "readme_task", "Hello, Manual task 3!", 0, 0)
+	manager.AddTask(context.TODO(), "manual_task-1", "full_task", "Hello, Manual task 1!", 0, 0)
+	manager.AddTask(context.TODO(), "manual_task-2", "full_task", "Hello, Manual task 2!", 1, 0)
+	manager.AddTask(context.TODO(), "manual_task-3", "full_task", "Hello, Manual task 3!", 0, 0)
 
 	time.Sleep(3 * time.Second)
 	cancel()
