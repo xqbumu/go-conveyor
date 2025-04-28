@@ -38,48 +38,48 @@ func (w *FaultyWorker) Produce(ctx context.Context) error {
 }
 
 // Consume implements the Consume method of the Worker interface
-func (w *FaultyWorker) Consume(ctx context.Context, t conveyor.Task) error {
+func (w *FaultyWorker) Consume(ctx context.Context, t conveyor.ITask) error {
 	select {
 	case <-ctx.Done():
-		log.Printf("Faulty Task %s (Type: %s) cancelled or timed out", t.ID, t.Type)
+		log.Printf("Faulty Task %s (Type: %s) cancelled or timed out", t.GetID(), t.GetType())
 		return ctx.Err()
 	default:
-		attempt := w.getAttemptCount(t.ID) // Get and increment the attempt count for the current task
-		log.Printf("Processing faulty task %s (Attempt: %d)", t.ID, attempt)
+		attempt := w.getAttemptCount(t.GetID()) // Get and increment the attempt count for the current task
+		log.Printf("Processing faulty task %s (Attempt: %d)", t.GetID(), attempt)
 
-		switch t.ID {
+		switch t.GetID() {
 		case "panic-task":
 			// Panic on the first attempt
 			if attempt == 1 {
-				log.Printf("Faulty task %s panicking on attempt %d", t.ID, attempt)
+				log.Printf("Faulty task %s panicking on attempt %d", t.GetID(), attempt)
 				panic("simulated panic")
 			}
 			// Succeed on the second attempt (after panic recovery)
-			log.Printf("Faulty task %s succeeded on attempt %d after panic recovery", t.ID, attempt)
+			log.Printf("Faulty task %s succeeded on attempt %d after panic recovery", t.GetID(), attempt)
 			return nil
 		case "retry-task":
 			// Fail on the first two attempts, succeed on the third attempt (TaskManager retries 3 times by default)
 			if attempt <= 2 {
-				log.Printf("Faulty task %s failing on attempt %d, will retry", t.ID, attempt)
+				log.Printf("Faulty task %s failing on attempt %d, will retry", t.GetID(), attempt)
 				return fmt.Errorf("simulated error on attempt %d", attempt)
 			}
-			log.Printf("Faulty task %s succeeded on attempt %d after retries", t.ID, attempt)
+			log.Printf("Faulty task %s succeeded on attempt %d after retries", t.GetID(), attempt)
 			return nil
 		case "success-task":
 			// Always succeed
-			log.Printf("Faulty task %s succeeded on attempt %d", t.ID, attempt)
+			log.Printf("Faulty task %s succeeded on attempt %d", t.GetID(), attempt)
 			return nil
 		default:
 			// Unknown task type, return an error
-			log.Printf("Faulty task %s received unknown ID", t.ID)
-			return fmt.Errorf("unknown task ID: %s", t.ID)
+			log.Printf("Faulty task %s received unknown ID", t.GetID())
+			return fmt.Errorf("unknown task ID: %s", t.GetID())
 		}
 	}
 }
 
 // Types implements the Types method of the Worker interface
-func (w *FaultyWorker) Types(ctx context.Context) []conveyor.Type {
-	return []conveyor.Type{"faulty_task"}
+func (w *FaultyWorker) Types(ctx context.Context) []any {
+	return []any{"faulty_task"}
 }
 
 // ExampleNewManager_faulty tests the panic recovery and retry logic of TaskManager
@@ -110,10 +110,10 @@ func ExampleNewManager_faulty() {
 	time.Sleep(100 * time.Millisecond)
 
 	// Add test tasks
-	manager.AddTask(context.TODO(), "panic-task", "faulty_task", "This task will panic", 0, 0)
-	manager.AddTask(context.TODO(), "retry-task", "faulty_task", "This task will retry", 0, 0)
-	manager.AddTask(context.TODO(), "success-task", "faulty_task", "This task will succeed", 0, 0)
-	manager.AddTask(context.TODO(), "unknown-task", "faulty_task", "This task has unknown ID", 0, 0) // Test unknown task ID
+	manager.AddTask(context.TODO(), conveyor.NewTask("panic-task", "faulty_task", 0, 0, "This task will panic"))
+	manager.AddTask(context.TODO(), conveyor.NewTask("retry-task", "faulty_task", 0, 0, "This task will retry"))
+	manager.AddTask(context.TODO(), conveyor.NewTask("success-task", "faulty_task", 0, 0, "This task will succeed"))
+	manager.AddTask(context.TODO(), conveyor.NewTask("unknown-task", "faulty_task", 0, 0, "This task has unknown ID")) // Test unknown task ID
 
 	// Wait for all tasks to complete
 	// Allow enough time for panic recovery and retries to occur

@@ -13,7 +13,7 @@ import (
 type Manager struct {
 	ctx                 context.Context      // Context for managing cancellation and timeouts
 	workers             []Worker             // List of all registered Worker instances
-	workerMap           map[Type]Worker      // Mapping from task type to corresponding Worker for quick lookup
+	workerMap           map[any]Worker       // Mapping from task type to corresponding Worker for quick lookup
 	metrics             Metrics              // Metrics for the task manager's operation
 	mu                  sync.RWMutex         // Read-write lock to protect concurrent access to workers and workerMap
 	taskSetManager      *TaskSetManager      // Task set manager for deduplication and periodic cleanup
@@ -22,9 +22,17 @@ type Manager struct {
 	config              ManagerConfig        // Configuration for the Manager
 }
 
-// NewManager creates and initializes a new TaskManager instance
-// using the WithOption pattern to pass in configuration.
 func NewManager(ctx context.Context, opts ...Option) (*Manager, error) {
+	manager, err := NewGenericManager(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return manager, nil
+}
+
+// NewGenericManager creates and initializes a new TaskManager instance
+// using the WithOption pattern to pass in configuration.
+func NewGenericManager(ctx context.Context, opts ...Option) (*Manager, error) {
 	// Create a ManagerConfig instance with default configuration
 	config := ManagerConfig{
 		ConsumerPoolManagerConfig: NewConsumerPoolManagerConfig(),
@@ -43,7 +51,7 @@ func NewManager(ctx context.Context, opts ...Option) (*Manager, error) {
 	m := &Manager{
 		ctx:            ctx,
 		workers:        make([]Worker, 0),
-		workerMap:      make(map[Type]Worker),
+		workerMap:      make(map[any]Worker),
 		taskSetManager: NewTaskSetManager(), // Initialize TaskSetManager
 		config:         config,              // Store the final configuration
 	}
@@ -117,14 +125,14 @@ func (m *Manager) rollbackAddTask(taskIdentifier string) {
 }
 
 // executeTaskConsume is a helper function to execute worker.Consume and recover from panic.
-func (m *Manager) executeTaskConsume(taskCtx context.Context, worker Worker, task Task) (err error) {
+func (m *Manager) executeTaskConsume(taskCtx context.Context, worker Worker, task ITask) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Recover from panic
 			err = PanicError{Value: r} // Wrap the panic value in a custom error
 			slog.Error("Task panicked during execution",
-				"taskID", task.ID,
-				"type", task.Type,
+				"taskID", task.GetID(),
+				"type", task.GetType(),
 				"panic", r)
 		}
 	}()
@@ -163,18 +171,18 @@ func (m *Manager) Stop() {
 
 // processTaskWithRetry encapsulates the task processing and retry logic
 // This function is now a method of Manager and is passed as processTaskFunc to ConsumerPoolManager
-func (m *Manager) processTaskWithRetry(ctx context.Context, task Task) {
-	maxRetries := 3                   // Maximum number of retries
-	taskIdentifier := task.Identify() // Get task identifier for logging and metrics update
+func (m *Manager) processTaskWithRetry(ctx context.Context, task ITask) {
+	maxRetries := 3                      // Maximum number of retries
+	taskIdentifier := task.GetIdentify() // Get task identifier for logging and metrics update
 
 	// Look up the corresponding Worker based on the task type
 	m.mu.RLock() // Read lock needed for reading workerMap
-	worker, ok := m.workerMap[task.Type]
+	worker, ok := m.workerMap[task.GetType()]
 	m.mu.RUnlock()
 
 	if !ok {
 		// If no corresponding Worker is found, log an error and mark the task as failed
-		slog.Error("No worker found for task type", "type", task.Type, "taskID", task.ID)
+		slog.Error("No worker found for task type", "type", task.GetType(), "taskID", task.GetID())
 		atomic.AddInt64(&m.metrics.TasksFailed, 1)
 		// Remove the task identifier from taskSetManager to indicate processing is complete (failed)
 		m.taskSetManager.Remove(taskIdentifier)
@@ -186,9 +194,9 @@ func (m *Manager) processTaskWithRetry(ctx context.Context, task Task) {
 	// The task context inherits from the context passed in by ConsumerPoolManager
 	taskCtx := ctx
 	var cancel context.CancelFunc
-	if task.Timeout > 0 {
+	if task.GetTimeout() > 0 {
 		// If the task has a timeout set, create a context with timeout.
-		taskCtx, cancel = context.WithTimeout(ctx, task.Timeout)
+		taskCtx, cancel = context.WithTimeout(ctx, task.GetTimeout())
 	} else {
 		// If the task has no timeout, create a cancellable context.
 		taskCtx, cancel = context.WithCancel(ctx)
@@ -216,16 +224,16 @@ func (m *Manager) processTaskWithRetry(ctx context.Context, task Task) {
 
 		// Task failed (error or panic)
 		slog.Error("Task execution failed",
-			"taskID", task.ID,
-			"type", task.Type,
+			"taskID", task.GetID(),
+			"type", task.GetType(),
 			"error", err,
 			"retryAttempt", i+1)
 
 		// Check if it is a panic and retryOnPanic is false
 		if _, isPanic := err.(PanicError); isPanic && !m.config.RetryOnPanic {
 			slog.Error("Task panicked and retryOnPanic is false, marking as failed",
-				"taskID", task.ID,
-				"type", task.Type,
+				"taskID", task.GetID(),
+				"type", task.GetType(),
 				"panicError", err) // Log the wrapped panic error
 			atomic.AddInt64(&m.metrics.TasksFailed, 1)
 			m.taskSetManager.Remove(taskIdentifier)
@@ -246,8 +254,8 @@ func (m *Manager) processTaskWithRetry(ctx context.Context, task Task) {
 		select {
 		case <-taskCtx.Done():
 			slog.Warn("Task canceled or timed out during retry wait",
-				"taskID", task.ID,
-				"type", task.Type,
+				"taskID", task.GetID(),
+				"type", task.GetType,
 				"error", taskCtx.Err())
 			atomic.AddInt64(&m.metrics.TasksFailed, 1)
 			m.taskSetManager.Remove(taskIdentifier)
@@ -259,7 +267,7 @@ func (m *Manager) processTaskWithRetry(ctx context.Context, task Task) {
 
 		// Wait before retrying (exponential backoff)
 		retryDelay := time.Second * time.Duration(i+1)
-		slog.Info("Retrying task", "taskID", task.ID, "type", task.Type, "delay", retryDelay)
+		slog.Info("Retrying task", "taskID", task.GetID(), "type", task.GetType, "delay", retryDelay)
 		time.Sleep(retryDelay) // Block and wait
 	}
 }
@@ -275,15 +283,8 @@ func (m *Manager) processTaskWithRetry(ctx context.Context, task Task) {
 //
 // Returns:
 //   - error: Returns an error if the task already exists, adding a high-priority task times out, or the context is cancelled
-func (m *Manager) AddTask(ctx context.Context, id string, taskType Type, data any, priority int, timeout time.Duration) error {
-	task := Task{
-		ID:       id,
-		Type:     taskType,
-		Data:     data,
-		Priority: priority,
-		Timeout:  timeout,
-	}
-	taskIdentifier := task.Identify()
+func (m *Manager) AddTask(ctx context.Context, task ITask) error {
+	taskIdentifier := task.GetIdentify()
 
 	// 1. Check if the task already exists and try to add it to the taskSetManager
 	// Use TaskSetManager to check if the task exists and add it
@@ -298,15 +299,15 @@ func (m *Manager) AddTask(ctx context.Context, id string, taskType Type, data an
 	}
 	atomic.AddInt64(&m.metrics.TasksQueued, 1) // Task successfully added to the set, increase queued count
 
-	slog.Debug("Attempting to add task to queue", "identifier", taskIdentifier, "priority", priority)
+	slog.Debug("Attempting to add task to queue", "identifier", taskIdentifier, "priority", task.GetPriority())
 
 	// 3. Get or create the corresponding queue through ConsumerPoolManager
 	// ConsumerPoolManager will be responsible for creating the queue and starting consumers
-	taskQueue, err := m.consumerPoolManager.GetOrCreateQueue(priority, taskIdentifier, m.processTaskWithRetry)
+	taskQueue, err := m.consumerPoolManager.GetOrCreateQueue(task.GetPriority(), taskIdentifier, m.processTaskWithRetry)
 	if err != nil {
 		// GetOrCreateQueue failed, rollback state
 		m.rollbackAddTask(taskIdentifier)
-		slog.Error("Failed to get or create task queue", "identifier", taskIdentifier, "priority", priority, "error", err)
+		slog.Error("Failed to get or create task queue", "identifier", taskIdentifier, "priority", task.GetPriority(), "error", err)
 		return err
 	}
 
@@ -315,9 +316,9 @@ func (m *Manager) AddTask(ctx context.Context, id string, taskType Type, data an
 	taskSent := sendErr == nil // Task is sent if Push returns no error
 
 	if sendErr == nil {
-		slog.Info("Task added successfully", "identifier", taskIdentifier, "priority", priority)
+		slog.Info("Task added successfully", "identifier", taskIdentifier, "priority", task.GetPriority())
 	} else {
-		slog.Error("Failed to push task to queue", "identifier", taskIdentifier, "priority", priority, "error", sendErr)
+		slog.Error("Failed to push task to queue", "identifier", taskIdentifier, "priority", task.GetPriority(), "error", sendErr)
 	}
 
 	// If the task was not successfully sent, perform a rollback

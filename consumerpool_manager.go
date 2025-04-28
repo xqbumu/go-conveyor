@@ -260,7 +260,7 @@ func (cpm *ConsumerPoolManager) Stop() {
 // processTaskFunc defines a function type for processing a single task.
 // This function type will be passed to startConsumer so that the ConsumerPoolManager
 // can call the actual task processing logic (processTaskWithRetry) defined in the TaskManager.
-type processTaskFunc func(ctx context.Context, task Task)
+type processTaskFunc func(ctx context.Context, task ITask)
 
 // GetCurrentConsumers returns the current number of active consumer goroutines.
 func (cpm *ConsumerPoolManager) GetCurrentConsumers() int32 {

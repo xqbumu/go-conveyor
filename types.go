@@ -14,9 +14,9 @@ type Worker interface {
 	// If the Worker does not need to automatically generate tasks, it can be implemented as an empty method.
 	Produce(ctx context.Context) error
 	// Consume processes the specified type of task.
-	Consume(ctx context.Context, task Task) error
+	Consume(ctx context.Context, task ITask) error
 	// Types returns the list of task types that the Worker can handle.
-	Types(ctx context.Context) []Type
+	Types(ctx context.Context) []any
 }
 
 // WorkerProduceCronSchedule is an optional interface that Workers can implement
@@ -27,21 +27,65 @@ type WorkerProduceCronSchedule interface {
 	ProduceCronSchedule() (string, bool)
 }
 
-// Type defines the type of task, using a string for easy extension.
-type Type string
+type ITask interface {
+	GetIdentify() string
+	GetID() string
+	GetType() any
+	GetPriority() int
+	GetTimeout() time.Duration
+}
+
+type TaskData[T any] interface {
+	Data() T
+}
 
 // Task defines a task, containing all the information needed to execute the task.
-type Task struct {
+type Task[T any] struct {
 	ID       string        // Unique ID of the task, used for deduplication and tracking.
-	Type     Type          // Type of the task, used to distribute to the corresponding Worker.
-	Data     any           // Data carried by the task, the specific type is determined by the task type.
+	Typ      any           // Type of the task, used to distribute to the corresponding Worker.
 	Priority int           // Task priority (0: normal, >0: high priority, high priority tasks will try to be processed faster).
 	Timeout  time.Duration // Task execution timeout (0 means no timeout).
+	Data     T             // Data carried by the task, the specific type is determined by the task type.
+}
+
+func NewTask[T any](id string, typ any, priority int, timeout time.Duration, data T) Task[T] {
+	return Task[T]{
+		ID:       id,
+		Typ:      typ,
+		Priority: priority,
+		Timeout:  timeout,
+		Data:     data,
+	}
 }
 
 // Identify returns the unique identifier of the task.
-func (t Task) Identify() string {
-	return fmt.Sprintf("%s:%s", t.ID, t.Type)
+func (t Task[T]) GetIdentify() string {
+	return fmt.Sprintf("%s:%s", t.ID, t.Typ)
+}
+
+// GetID returns the unique GetID of the task.
+func (t Task[T]) GetID() string {
+	return t.ID
+}
+
+// Type returns the type of the task.
+func (t Task[T]) GetType() any {
+	return t.Typ
+}
+
+// Priority returns the priority of the task.
+func (t Task[T]) GetPriority() int {
+	return t.Priority
+}
+
+// Timeout returns the timeout duration of the task.
+func (t Task[T]) GetTimeout() time.Duration {
+	return t.Timeout
+}
+
+// Data returns the data associated with the task.
+func (t Task[T]) GetData() T {
+	return t.Data
 }
 
 // PanicError wraps a panic value to be returned as an error.
@@ -56,9 +100,9 @@ func (e PanicError) Error() string {
 // TaskQueue defines the interface for task storage and retrieval mechanisms.
 type TaskQueue interface {
 	// Push adds a task to the queue.
-	Push(task Task) error
+	Push(task ITask) error
 	// Pop retrieves a task from the queue, blocking until a task is available or the context is done.
-	Pop(ctx context.Context) (Task, error)
+	Pop(ctx context.Context) (ITask, error)
 	// Len returns the current number of tasks in the queue.
 	Len() int
 	// Close closes the queue, preventing further pushes and allowing existing tasks to be processed.

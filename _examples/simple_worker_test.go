@@ -19,14 +19,18 @@ func (w *SimpleWorker) Produce(ctx context.Context) error {
 }
 
 // Consume implements the Consume method of the Worker interface.
-func (w *SimpleWorker) Consume(ctx context.Context, t conveyor.Task) error {
+func (w *SimpleWorker) Consume(ctx context.Context, task conveyor.ITask) error {
+	t, ok := task.(conveyor.Task[string])
+	if !ok {
+		return fmt.Errorf("task is not of type *conveyor.Task")
+	}
 	select {
 	case <-ctx.Done():
-		log.Printf("Task %s (Type: %s) cancelled or timed out", t.ID, t.Type)
+		log.Printf("Task %s (Type: %s) cancelled or timed out", t.GetID(), t.GetType())
 		return ctx.Err()
 	default:
 		// Simulate task processing.
-		log.Printf("Processing task %s (Type: %s, Priority: %d, Data: %v)", t.ID, t.Type, t.Priority, t.Data)
+		log.Printf("Processing task %s (Type: %s, Priority: %d, Data: %v)", t.GetID(), t.GetType(), t.GetPriority(), t.GetData())
 		time.Sleep(50 * time.Millisecond) // Simulate work.
 		// Actual processing can be done here based on t.Data.
 		return nil
@@ -34,8 +38,8 @@ func (w *SimpleWorker) Consume(ctx context.Context, t conveyor.Task) error {
 }
 
 // Types implements the Types method of the Worker interface.
-func (w *SimpleWorker) Types(ctx context.Context) []conveyor.Type {
-	return []conveyor.Type{"simple_string_task"}
+func (w *SimpleWorker) Types(ctx context.Context) []any {
+	return []any{"simple_string_task"}
 }
 
 // ExampleNewManager demonstrates how to create and use TaskManager.
@@ -68,11 +72,11 @@ func ExampleNewManager_simple() {
 	time.Sleep(100 * time.Millisecond)
 
 	// Add some tasks.
-	manager.AddTask(context.TODO(), "task-1", "simple_string_task", "Hello, Task 1!", 0, 0)
-	manager.AddTask(context.TODO(), "task-2", "simple_string_task", "Hello, Task 2!", 1, 0) // High priority task.
-	manager.AddTask(context.TODO(), "task-3", "simple_string_task", "Hello, Task 3!", 0, 0)
-	manager.AddTask(context.TODO(), "task-4", "simple_string_task", "Hello, Task 4!", 1, 0) // High priority task.
-	manager.AddTask(context.TODO(), "task-5", "simple_string_task", "Hello, Task 5!", 0, 0)
+	manager.AddTask(context.TODO(), conveyor.NewTask("task-1", "simple_string_task", 0, 0, "Hello, Task 1!"))
+	manager.AddTask(context.TODO(), conveyor.NewTask("task-2", "simple_string_task", 1, 0, "Hello, Task 2!")) // High priority task.
+	manager.AddTask(context.TODO(), conveyor.NewTask("task-3", "simple_string_task", 0, 0, "Hello, Task 3!"))
+	manager.AddTask(context.TODO(), conveyor.NewTask("task-4", "simple_string_task", 1, 0, "Hello, Task 4!")) // High priority task.
+	manager.AddTask(context.TODO(), conveyor.NewTask("task-5", "simple_string_task", 0, 0, "Hello, Task 5!"))
 
 	// Wait for a while to let the tasks process.
 	time.Sleep(500 * time.Millisecond)

@@ -18,25 +18,31 @@ type FullWorker struct {
 
 // Produce implements the Produce method of the Worker interface.
 func (w *FullWorker) Produce(ctx context.Context) error {
-	w.index.Add(1)
+	idx := w.index.Add(1)
 	return w.manager.AddTask(
 		ctx,
-		fmt.Sprintf("auto_task-%d", w.index),
-		"full_task",
-		fmt.Sprintf("Hello, Auto task %d!", w.index),
-		0,
-		0,
+		conveyor.NewTask(
+			fmt.Sprintf("auto_task-%d", idx),
+			"full_task",
+			0,
+			0,
+			fmt.Sprintf("Hello, Auto task %d!", idx),
+		),
 	)
 }
 
 // Consume implements the Consume method of the Worker interface.
-func (w *FullWorker) Consume(ctx context.Context, task conveyor.Task) error {
+func (w *FullWorker) Consume(ctx context.Context, task conveyor.ITask) error {
+	t, ok := task.(conveyor.Task[string])
+	if !ok {
+		return fmt.Errorf("task is not of type *conveyor.Task")
+	}
 	select {
 	case <-ctx.Done():
-		log.Printf("Task %s (Type: %s) cancelled or timed out\n", task.ID, task.Type)
+		log.Printf("Task %s (Type: %s) cancelled or timed out\n", t.GetID(), t.GetType())
 		return ctx.Err()
 	default:
-		log.Printf("Processing task %s (Type: %s, Priority: %d, Data: %v)\n", task.ID, task.Type, task.Priority, task.Data)
+		log.Printf("Processing task %s (Type: %s, Priority: %d, Data: %v)\n", t.GetID(), t.GetType(), t.GetPriority(), t.GetData())
 		time.Sleep(50 * time.Millisecond)
 		return nil
 	}
@@ -48,20 +54,21 @@ func (w *FullWorker) ProduceCronSchedule() (string, bool) {
 }
 
 // Types returns the list of task types that the Worker can handle.
-func (w *FullWorker) Types(ctx context.Context) []conveyor.Type {
-	return []conveyor.Type{"full_task"}
+func (w *FullWorker) Types(ctx context.Context) []any {
+	return []any{"full_task"}
 }
 
 func ExampleNewManager_full() {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	manager, err := conveyor.NewManager(
+	manager, err := conveyor.NewGenericManager(
 		ctx,
 		conveyor.WithDefaultBufferSize(10),
 		conveyor.WithDefaultConsumers(2),
 		conveyor.WithMaxTotalConsumers(5),
 	)
 	if err != nil {
+		cancel()
 		log.Printf("Failed to create TaskManager: %v\n", err)
 		return
 	}
@@ -70,9 +77,9 @@ func ExampleNewManager_full() {
 
 	go manager.Start()
 
-	manager.AddTask(context.TODO(), "manual_task-1", "full_task", "Hello, Manual task 1!", 0, 0)
-	manager.AddTask(context.TODO(), "manual_task-2", "full_task", "Hello, Manual task 2!", 1, 0)
-	manager.AddTask(context.TODO(), "manual_task-3", "full_task", "Hello, Manual task 3!", 0, 0)
+	manager.AddTask(context.TODO(), conveyor.NewTask("manual_task-1", "full_task", 0, 0, "Hello, Manual task 1!"))
+	manager.AddTask(context.TODO(), conveyor.NewTask("manual_task-2", "full_task", 1, 0, "Hello, Manual task 2!"))
+	manager.AddTask(context.TODO(), conveyor.NewTask("manual_task-3", "full_task", 0, 0, "Hello, Manual task 3!"))
 
 	time.Sleep(1500 * time.Millisecond)
 	cancel()
