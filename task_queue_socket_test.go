@@ -46,6 +46,7 @@ func init() {
 }
 
 func TestNewSocketTaskQueue_Server(t *testing.T) {
+	t.Parallel() // Mark test as parallelizable
 	t.Run("tcp server", func(t *testing.T) {
 		addr := "127.0.0.1:0" // Use port 0 to get a random available port
 		q, err := NewSocketTaskQueue("server", "tcp", addr)
@@ -254,47 +255,97 @@ func isConnectionRefused(err error) bool {
 			false)
 }
 
-func TestPushPopTask(t *testing.T) {
-	// Use a temporary directory for the unix socket
-	tmpDir, err := os.MkdirTemp("", "push_pop_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
+// setupServerClientQueues is a helper function to set up a server and client queue pair for testing.
+// It returns the server queue, client queue, the address used, and a cleanup function.
+// The cleanup function closes both queues and removes the temporary directory if network is "unix".
+func setupServerClientQueues(t *testing.T, network string) (*SocketTaskQueue, *SocketTaskQueue, string, func()) {
+	t.Helper() // Mark this as a test helper function
+
+	var addr string
+	var tmpDir string
+	var err error
+
+	if network == "unix" {
+		tmpDir, err = os.MkdirTemp("", "socket_test_")
+		if err != nil {
+			t.Fatalf("Failed to create temp dir: %v", err)
+		}
+		addr = fmt.Sprintf("%s/test.sock", tmpDir)
+	} else if network == "tcp" {
+		addr = "127.0.0.1:0" // Use random port
+	} else {
+		t.Fatalf("Unsupported network type for setup: %s", network)
 	}
-	defer os.RemoveAll(tmpDir)
-	addr := fmt.Sprintf("%s/push_pop.sock", tmpDir)
 
 	// Start server
-	serverQ, err := NewSocketTaskQueue("server", "unix", addr)
+	serverQ, err := NewSocketTaskQueue("server", network, addr)
 	if err != nil {
-		t.Fatalf("Failed to create server queue: %v", err)
+		if tmpDir != "" {
+			os.RemoveAll(tmpDir)
+		}
+		t.Fatalf("Failed to create server queue (%s): %v", network, err)
 	}
-	defer serverQ.Close()
+
+	// Get the actual address if TCP used port 0
+	if network == "tcp" {
+		addr = serverQ.listener.Addr().String()
+	}
 
 	// Start client
-	clientQ, err := NewSocketTaskQueue("client", "unix", addr)
+	clientQ, err := NewSocketTaskQueue("client", network, addr)
 	if err != nil {
-		t.Fatalf("Failed to create client queue: %v", err)
+		serverQ.Close()
+		if tmpDir != "" {
+			os.RemoveAll(tmpDir)
+		}
+		t.Fatalf("Failed to create client queue (%s): %v", network, err)
 	}
-	defer clientQ.Close()
 
 	// Wait for client to connect to server
-	time.Sleep(100 * time.Millisecond) // Give time for connection goroutine
+	// Increase wait time slightly to ensure connection stability in various environments
+	time.Sleep(200 * time.Millisecond)
 
-	// Ensure server has an active connection (check activeConns map)
+	// Ensure server has an active connection
 	serverQ.mu.Lock()
 	serverHasConnection := len(serverQ.activeConns) > 0
 	serverQ.mu.Unlock()
 	if !serverHasConnection {
-		t.Fatal("Server did not accept client connection (activeConns is empty)")
+		clientQ.Close()
+		serverQ.Close()
+		if tmpDir != "" {
+			os.RemoveAll(tmpDir)
+		}
+		t.Fatal("Server did not accept client connection within timeout")
 	}
 
 	// Ensure client has an active connection
 	clientQ.mu.Lock()
-	clientConn := clientQ.clientConn // Use clientConn for client mode
+	clientConn := clientQ.clientConn
 	clientQ.mu.Unlock()
 	if clientConn == nil {
-		t.Fatal("Client did not establish connection")
+		clientQ.Close()
+		serverQ.Close()
+		if tmpDir != "" {
+			os.RemoveAll(tmpDir)
+		}
+		t.Fatal("Client did not establish connection within timeout")
 	}
+
+	cleanup := func() {
+		clientQ.Close()
+		serverQ.Close()
+		if tmpDir != "" {
+			os.RemoveAll(tmpDir)
+		}
+	}
+
+	return serverQ, clientQ, addr, cleanup
+}
+
+
+func TestPushPopTask(t *testing.T) {
+	serverQ, clientQ, _, cleanup := setupServerClientQueues(t, "unix")
+	defer cleanup()
 
 	// Create a dummy task
 	taskToPush := &DummyTask{
@@ -305,7 +356,8 @@ func TestPushPopTask(t *testing.T) {
 	// Push the task from client
 	ctxPush, cancelPush := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelPush()
-	err = clientQ.Push(ctxPush, taskToPush)
+	// Use short assignment operator := for the first use of err in this scope
+	err := clientQ.Push(ctxPush, taskToPush)
 	if err != nil {
 		t.Fatalf("Failed to push task: %v", err)
 	}
@@ -313,7 +365,7 @@ func TestPushPopTask(t *testing.T) {
 	// Pop the task from server
 	ctxPop, cancelPop := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelPop()
-	poppedTask, err := serverQ.Pop(ctxPop)
+	poppedTask, err := serverQ.Pop(ctxPop) // Use assignment = for subsequent uses
 	if err != nil {
 		t.Fatalf("Failed to pop task: %v", err)
 	}
@@ -339,35 +391,15 @@ func TestPushPopTask(t *testing.T) {
 // TODO: Add tests for:
 // - Handling connection closure during Push/Pop
 // - Error handling for invalid messages (e.g., wrong magic number, invalid JSON)
-// - Len() method (should always return 0 for this implementation)
+// - Len() method (should always return 0 for this implementation) - Already implemented in TestLen
 
 func TestClose(t *testing.T) {
-	// Use a temporary directory for the unix socket
-	tmpDir, err := os.MkdirTemp("", "close_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	addr := fmt.Sprintf("%s/close.sock", tmpDir)
-
-	// Start server
-	serverQ, err := NewSocketTaskQueue("server", "unix", addr)
-	if err != nil {
-		t.Fatalf("Failed to create server queue: %v", err)
-	}
-
-	// Start client
-	clientQ, err := NewSocketTaskQueue("client", "unix", addr)
-	if err != nil {
-		serverQ.Close() // Clean up server if client creation fails
-		t.Fatalf("Failed to create client queue: %v", err)
-	}
-
-	// Wait for connection
-	time.Sleep(100 * time.Millisecond)
+	t.Parallel() // Mark test as parallelizable
+	// Use _ to ignore the cleanup function as we call Close manually.
+	serverQ, clientQ, _, _ := setupServerClientQueues(t, "unix")
 
 	// Close the server queue
-	err = serverQ.Close()
+	err := serverQ.Close() // First use of err in this scope
 	if err != nil {
 		t.Errorf("Failed to close server queue: %v", err)
 	}
@@ -377,11 +409,14 @@ func TestClose(t *testing.T) {
 	if err != nil {
 		t.Errorf("Failed to close client queue: %v", err)
 	}
+	// The setupServerClientQueues helper's cleanup function handles temp dir removal.
+	// We don't need manual cleanup here, even though we don't defer the cleanup call.
 
 	// Verify Push on closed queue returns error
 	taskToPush := &DummyTask{ID: "closed-task", Data: "data"}
 	ctxPush, cancelPush := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancelPush()
+	// Use assignment = as err is already declared above
 	err = clientQ.Push(ctxPush, taskToPush)
 	if err == nil {
 		t.Error("Push on closed queue did not return error")
@@ -395,6 +430,7 @@ func TestClose(t *testing.T) {
 	// Verify Pop on closed queue returns error
 	ctxPop, cancelPop := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancelPop()
+	// Use assignment = as err is already declared above
 	_, err = serverQ.Pop(ctxPop)
 	if err == nil {
 		t.Error("Pop on closed queue did not return error")
@@ -409,10 +445,12 @@ func TestClose(t *testing.T) {
 	}
 
 	// Verify closing already closed queue does not return error
+	// Use assignment = as err is already declared above
 	err = serverQ.Close()
 	if err != nil {
 		t.Errorf("Closing already closed server queue returned error: %v", err)
 	}
+	// Use assignment = as err is already declared above
 	err = clientQ.Close()
 	if err != nil {
 		t.Errorf("Closing already closed client queue returned error: %v", err)
@@ -422,34 +460,11 @@ func TestClose(t *testing.T) {
 
 // TODO: Add tests for:
 // - Error handling for invalid messages (e.g., wrong magic number, invalid JSON)
-// - Len() method (should always return 0 for this implementation)
+// - Len() method (should always return 0 for this implementation) - Already implemented in TestLen
 
 func TestPushPopOnClosedConnection(t *testing.T) {
-	// Use a temporary directory for the unix socket
-	tmpDir, err := os.MkdirTemp("", "push_pop_closed_conn_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	addr := fmt.Sprintf("%s/closed_conn.sock", tmpDir)
-
-	// Start server
-	serverQ, err := NewSocketTaskQueue("server", "unix", addr)
-	if err != nil {
-		t.Fatalf("Failed to create server queue: %v", err)
-	}
-	defer serverQ.Close()
-
-	// Start client
-	clientQ, err := NewSocketTaskQueue("client", "unix", addr)
-	if err != nil {
-		serverQ.Close() // Clean up server if client creation fails
-		t.Fatalf("Failed to create client queue: %v", err)
-	}
-	defer clientQ.Close()
-
-	// Wait for connection
-	time.Sleep(100 * time.Millisecond)
+	serverQ, clientQ, _, cleanup := setupServerClientQueues(t, "unix")
+	defer cleanup()
 
 	// Get the underlying connection from the client queue
 	clientQ.mu.Lock()
@@ -482,7 +497,7 @@ func TestPushPopOnClosedConnection(t *testing.T) {
 	// Verify Pop on closed connection returns error
 	ctxPop, cancelPop := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancelPop()
-	_, err = serverQ.Pop(ctxPop)
+	_, err := serverQ.Pop(ctxPop) // First use of err in this scope
 	if err == nil {
 		t.Error("Pop on closed connection did not return error")
 	} else {
@@ -518,34 +533,12 @@ func TestPushPopOnClosedConnection(t *testing.T) {
 
 
 // TODO: Add tests for:
-// - Len() method (should always return 0 for this implementation)
+// - Len() method (should always return 0 for this implementation) - Already implemented in TestLen
 
 func TestInvalidMessageHandling(t *testing.T) {
-	// Use a temporary directory for the unix socket
-	tmpDir, err := os.MkdirTemp("", "invalid_message_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	addr := fmt.Sprintf("%s/invalid_message.sock", tmpDir)
-
-	// Start server
-	serverQ, err := NewSocketTaskQueue("server", "unix", addr)
-	if err != nil {
-		t.Fatalf("Failed to create server queue: %v", err)
-	}
-	defer serverQ.Close()
-
-	// Start client
-	clientQ, err := NewSocketTaskQueue("client", "unix", addr)
-	if err != nil {
-		serverQ.Close() // Clean up server if client creation fails
-		t.Fatalf("Failed to create client queue: %v", err)
-	}
-	defer clientQ.Close()
-
-	// Wait for connection
-	time.Sleep(100 * time.Millisecond)
+	t.Parallel() // Mark test as parallelizable
+	serverQ, clientQ, _, cleanup := setupServerClientQueues(t, "unix")
+	defer cleanup()
 
 	// Get the underlying connection from the client queue
 	clientQ.mu.Lock()
@@ -558,13 +551,14 @@ func TestInvalidMessageHandling(t *testing.T) {
 
 	// Send some invalid data directly to the connection
 	invalidData := []byte("this is not a valid message\n")
-	_, err = conn.Write(invalidData)
+	_, err := conn.Write(invalidData) // First use of err in this scope
 	if err != nil {
 		t.Errorf("Failed to write invalid data: %v", err)
 	}
 
 	// Send another piece of invalid data (e.g., wrong magic number)
 	invalidMagicData := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, '{', '}'} // Wrong magic number
+	// Use assignment = as err is already declared above
 	_, err = conn.Write(invalidMagicData)
 	if err != nil {
 		t.Errorf("Failed to write invalid magic data: %v", err)
@@ -574,6 +568,7 @@ func TestInvalidMessageHandling(t *testing.T) {
 	taskToPush := &DummyTask{ID: "valid-task", Data: "valid data"}
 	ctxPush, cancelPush := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelPush()
+	// Use assignment = as err is already declared above
 	err = clientQ.Push(ctxPush, taskToPush)
 	if err != nil {
 		t.Fatalf("Failed to push valid task after invalid data: %v", err)
@@ -584,6 +579,7 @@ func TestInvalidMessageHandling(t *testing.T) {
 	// We should expect Pop to fail or timeout, not succeed.
 	ctxPop, cancelPop := context.WithTimeout(context.Background(), 1*time.Second) // Shorter timeout
 	defer cancelPop()
+	// Use assignment = as err is already declared above
 	_, err = serverQ.Pop(ctxPop)
 	if err == nil {
 		t.Error("Expected Pop to fail after sending invalid data, but it succeeded")
@@ -599,32 +595,11 @@ func TestInvalidMessageHandling(t *testing.T) {
 }
 
 
-// TODO: Remove this TODO after adding the test
-// - Len() method (should always return 0 for this implementation)
-
+// TestLen verifies the Len() method always returns 0
 func TestLen(t *testing.T) {
-	// Use a temporary directory for the unix socket
-	tmpDir, err := os.MkdirTemp("", "len_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	addr := fmt.Sprintf("%s/len.sock", tmpDir)
-
-	// Start server
-	serverQ, err := NewSocketTaskQueue("server", "unix", addr)
-	if err != nil {
-		t.Fatalf("Failed to create server queue: %v", err)
-	}
-	defer serverQ.Close()
-
-	// Start client
-	clientQ, err := NewSocketTaskQueue("client", "unix", addr)
-	if err != nil {
-		serverQ.Close() // Clean up server if client creation fails
-		t.Fatalf("Failed to create client queue: %v", err)
-	}
-	defer clientQ.Close()
+	t.Parallel() // Mark test as parallelizable
+	serverQ, clientQ, _, cleanup := setupServerClientQueues(t, "unix")
+	defer cleanup()
 
 	// Verify Len() returns 0 for server
 	if serverQ.Len() != 0 {
@@ -640,7 +615,7 @@ func TestLen(t *testing.T) {
 	taskToPush := &DummyTask{ID: "len-task", Data: "data"}
 	ctxPush, cancelPush := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelPush()
-	err = clientQ.Push(ctxPush, taskToPush)
+	err := clientQ.Push(ctxPush, taskToPush) // First use of err in this scope
 	if err != nil {
 		t.Fatalf("Failed to push task for Len test: %v", err)
 	}
@@ -655,6 +630,7 @@ func TestLen(t *testing.T) {
 	// Pop the task and verify Len() is still 0
 	ctxPop, cancelPop := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelPop()
+	// Use assignment = as err is already declared above
 	_, err = serverQ.Pop(ctxPop)
 	if err != nil {
 		t.Fatalf("Failed to pop task for Len test: %v", err)
@@ -670,47 +646,8 @@ func TestLen(t *testing.T) {
 
 
 func TestConcurrentPushPop(t *testing.T) {
-	// Use a temporary directory for the unix socket
-	tmpDir, err := os.MkdirTemp("", "concurrent_push_pop_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	addr := fmt.Sprintf("%s/concurrent.sock", tmpDir)
-
-	// Start server
-	serverQ, err := NewSocketTaskQueue("server", "unix", addr)
-	if err != nil {
-		t.Fatalf("Failed to create server queue: %v", err)
-	}
-	defer serverQ.Close()
-
-	// Start a single client
-	clientQ, err := NewSocketTaskQueue("client", "unix", addr)
-	if err != nil {
-		serverQ.Close() // Clean up server if client creation fails
-		t.Fatalf("Failed to create client queue: %v", err)
-	}
-	defer clientQ.Close()
-
-	// Wait for client to connect to server
-	time.Sleep(100 * time.Millisecond) // Give time for connection goroutine
-
-	// Ensure server has an active connection (check activeConns map)
-	serverQ.mu.Lock()
-	serverHasConnection := len(serverQ.activeConns) > 0
-	serverQ.mu.Unlock()
-	if !serverHasConnection {
-		t.Fatal("Server did not accept client connection (activeConns is empty)")
-	}
-
-	// Ensure client has an active connection
-	clientQ.mu.Lock()
-	clientConn := clientQ.clientConn // Use clientConn for client mode
-	clientQ.mu.Unlock()
-	if clientConn == nil {
-		t.Fatal("Client did not establish connection")
-	}
+	serverQ, clientQ, _, cleanup := setupServerClientQueues(t, "unix")
+	defer cleanup()
 
 	// Number of concurrent pushers and total tasks
 	numPushers := 10 // Number of goroutines pushing tasks

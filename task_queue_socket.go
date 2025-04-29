@@ -40,17 +40,23 @@ type SocketTaskQueue struct {
 	cond        *sync.Cond // Condition variable to signal connection status changes (primarily for client reconnect)
 	closed      bool
 
-	// Channels for buffering tasks
-	// In server mode, this is the channel for tasks received from ALL clients.
-	// In client mode, this is the channel for tasks to be sent to the server.
+	// taskChan is the primary channel for task exchange.
+	// - In server mode: It receives deserialized tasks from the messageProcessor (originating from any connected client via readChan).
+	//                  The Pop() method reads from this channel.
+	// - In client mode: The Push() method sends marshaled tasks (as []byte) to writeChan, which are then sent over the socket.
+	//                  This channel is NOT directly used by Push/Pop in client mode for task objects.
 	taskChan chan ITask
 
-	// Channel for messages to be sent over the socket
-	// This is used internally by the writer goroutine.
+	// writeChan buffers marshaled messages (task data wrapped in SocketMessage, then marshaled to JSON bytes)
+	// waiting to be sent over the network connection(s).
+	// - In client mode: Push() sends marshaled message bytes here. The writerLoop reads from this channel and writes to the clientConn.
+	// - In server mode: This channel is used by the writerLoop associated with EACH client connection.
+	//                   Currently, the server only receives tasks (Pop), it doesn't Push tasks back, so this channel is less utilized in server mode's core logic but necessary for the writerLoop structure.
 	writeChan chan []byte
 
-	// Channel for received messages from the socket
-	// This is used internally by the reader goroutine.
+	// readChan buffers raw message bytes received from the network connection(s) before processing.
+	// - The readerLoop associated with each connection reads raw bytes, frames them into messages (using readMessage), and sends the message bytes here.
+	// - The single messageProcessor goroutine reads from this channel, deserializes the message bytes into ITask objects, and sends them to taskChan.
 	readChan chan []byte
 
 	// WaitGroup to wait for goroutines to finish
@@ -344,46 +350,46 @@ func (q *SocketTaskQueue) Len() int {
 	return 0
 }
 
-// closeConnectionHandles 关闭活动的连接句柄（基于模式）。
-// 应在设置 q.closed = true 并取消上下文后调用。
+// closeConnectionHandles closes active connection handles based on the mode.
+// Should be called after setting q.closed = true and canceling the context.
 func (q *SocketTaskQueue) closeConnectionHandles() []error {
 	q.mu.Lock()
 	var clientConnToClose net.Conn
 	var serverConnsToClose []net.Conn
 	if q.mode == "client" {
 		clientConnToClose = q.clientConn
-		q.clientConn = nil // 清除活动的客户端连接
-	} else { // 服务器模式
+		q.clientConn = nil // Clear the active client connection
+	} else { // server mode
 		serverConnsToClose = make([]net.Conn, 0, len(q.activeConns))
 		for conn := range q.activeConns {
 			serverConnsToClose = append(serverConnsToClose, conn)
 		}
-		q.activeConns = make(map[net.Conn]struct{}) // 清除活动的服务器连接映射
+		q.activeConns = make(map[net.Conn]struct{}) // Clear the active server connections map
 	}
-	q.mu.Unlock() // 在关闭句柄之前解锁
+	q.mu.Unlock() // Unlock before closing handles
 
 	var connErrs []error
 	if q.mode == "client" && clientConnToClose != nil {
-		slog.Info("在 Close 期间关闭捕获的客户端连接句柄", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
+		slog.Info("Closing captured client connection handle during Close", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
 		if closeErr := clientConnToClose.Close(); closeErr != nil {
-			// 检查是否是已关闭错误
+			// Check if it's a 'use of closed network connection' error
 			if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
-				connErrs = append(connErrs, fmt.Errorf("关闭客户端连接句柄失败: %w", closeErr))
-				slog.Error("关闭客户端连接句柄时出错", "error", closeErr)
+				connErrs = append(connErrs, fmt.Errorf("failed to close client connection handle: %w", closeErr))
+				slog.Error("Error closing client connection handle", "error", closeErr)
 			} else {
-				slog.Debug("客户端连接句柄已并发关闭，在 Close 中忽略错误", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
+				slog.Debug("Client connection handle closed concurrently, ignoring error in Close", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
 			}
 		}
 	} else if q.mode == "server" {
-		slog.Info("在 Close 期间关闭捕获的服务器连接句柄", "count", len(serverConnsToClose))
+		slog.Info("Closing captured server connection handles during Close", "count", len(serverConnsToClose))
 		for _, conn := range serverConnsToClose {
 			if closeErr := conn.Close(); closeErr != nil {
-				// 检查是否是已关闭错误
+				// Check if it's a 'use of closed network connection' error
 				if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
-					connErrs = append(connErrs, fmt.Errorf("关闭服务器连接句柄 (%s) 失败: %w", conn.RemoteAddr(), closeErr))
-					slog.Error("关闭服务器连接句柄时出错", "remote_addr", conn.RemoteAddr(), "error", closeErr)
+					connErrs = append(connErrs, fmt.Errorf("failed to close server connection handle (%s): %w", conn.RemoteAddr(), closeErr))
+					slog.Error("Error closing server connection handle", "remote_addr", conn.RemoteAddr(), "error", closeErr)
 				} else {
-					slog.Debug("服务器连接句柄已并发关闭，在 Close 中忽略错误", "remote_addr", conn.RemoteAddr())
+					slog.Debug("Server connection handle closed concurrently, ignoring error in Close", "remote_addr", conn.RemoteAddr())
 				}
 			}
 		}
@@ -401,25 +407,25 @@ func (q *SocketTaskQueue) Close() error {
 	q.closed = true
 	q.mu.Unlock()
 
-	slog.Info("正在关闭 socket 任务队列")
+	slog.Info("Closing socket task queue")
 
-	// 取消上下文以通知 goroutine 退出
+	// Cancel context to signal goroutines to exit
 	q.cancel()
 
-	// 关闭监听器（如果是服务器模式）
+	// Close the listener (if in server mode)
 	var listenerErr error
 	if q.listener != nil {
-		slog.Info("正在关闭监听器")
+		slog.Info("Closing listener")
 		if closeErr := q.listener.Close(); closeErr != nil {
-			listenerErr = fmt.Errorf("关闭监听器失败: %w", closeErr)
+			listenerErr = fmt.Errorf("failed to close listener: %w", closeErr)
 		}
 	}
 
-	// 关闭活动的连接句柄
-	connErrs := q.closeConnectionHandles() // 调用辅助函数
+	// Close active connection handles
+	connErrs := q.closeConnectionHandles() // Call the helper function
 
-	// 合并监听器和连接错误
-	finalErr := errors.Join(listenerErr, errors.Join(connErrs...)) // 合并所有收集到的非 nil 错误
+	// Combine listener and connection errors
+	finalErr := errors.Join(listenerErr, errors.Join(connErrs...)) // Combine all collected non-nil errors
 
 	// 关闭 channel
 	close(q.writeChan)
@@ -651,7 +657,7 @@ type SocketMessage struct {
 }
 
 // Define a magic number for the protocol header
-var magicNumber = [4]byte{0x1A, 0x2B, 0x3C, 0x4D}
+const magicNumber = "\x1A\x2B\x3C\x4D" // Use a string constant for the byte sequence
 
 // readMessage reads a length-prefixed message with a magic number from the connection.
 func (q *SocketTaskQueue) readMessage(conn net.Conn) ([]byte, error) {
@@ -661,7 +667,7 @@ func (q *SocketTaskQueue) readMessage(conn net.Conn) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read magic number: %w", err)
 	}
 	// Verify the magic number
-	if !bytes.Equal(receivedMagic, magicNumber[:]) {
+	if !bytes.Equal(receivedMagic, []byte(magicNumber)) { // Compare with the byte representation of the constant string
 		return nil, errInvalidMagicNumber
 	}
 
@@ -689,7 +695,7 @@ func (q *SocketTaskQueue) readMessage(conn net.Conn) ([]byte, error) {
 // writeMessage writes a length-prefixed message with a magic number to the connection.
 func (q *SocketTaskQueue) writeMessage(conn net.Conn, message []byte) error {
 	// Write the magic number
-	if _, err := conn.Write(magicNumber[:]); err != nil {
+	if _, err := conn.Write([]byte(magicNumber)); err != nil { // Write the byte representation of the constant string
 		return fmt.Errorf("failed to write magic number: %w", err)
 	}
 
