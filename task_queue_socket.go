@@ -17,8 +17,9 @@ import (
 )
 
 var (
-	taskRegistry        = make(map[string]func() ITask)
+	taskRegistry          = make(map[string]func() ITask)
 	errInvalidMagicNumber = errors.New("invalid magic number received")
+	magicNumber           = []byte{0x1A, 0x2B, 0x3C, 0x4D} // Define as byte slice directly
 )
 
 // RegisterTaskType registers a task type with the socket task queue for deserialization.
@@ -35,7 +36,7 @@ type SocketTaskQueue struct {
 	activeConns map[net.Conn]struct{} // Server mode: tracks active client connections
 	addr        string
 	network     string
-	mode        string // "server" or "client"
+	mode        string     // "server" or "client"
 	mu          sync.Mutex // Protects clientConn, activeConns, closed, listener fields
 	cond        *sync.Cond // Condition variable to signal connection status changes (primarily for client reconnect)
 	closed      bool
@@ -80,8 +81,8 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 		mode:        mode,
 		activeConns: make(map[net.Conn]struct{}), // Initialize for server mode
 		taskChan:    make(chan ITask, 1000),      // Buffered channel for tasks
-		writeChan:   make(chan []byte, 1000),    // Buffered channel for messages to write
-		readChan:    make(chan []byte, 1000),    // Buffered channel for messages read
+		writeChan:   make(chan []byte, 1000),     // Buffered channel for messages to write
+		readChan:    make(chan []byte, 1000),     // Buffered channel for messages read
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -474,7 +475,6 @@ func (q *SocketTaskQueue) messageProcessor() {
 				continue // Skip this message and continue processing
 			}
 
-
 			// Use the message.TaskType to determine the concrete task type
 			// and unmarshal message.TaskData into an instance of that type.
 			taskFactory, ok := taskRegistry[message.TaskType]
@@ -656,9 +656,6 @@ type SocketMessage struct {
 	TaskData json.RawMessage `json:"task_data"` // Raw JSON bytes of the task data
 }
 
-// Define a magic number for the protocol header
-const magicNumber = "\x1A\x2B\x3C\x4D" // Use a string constant for the byte sequence
-
 // readMessage reads a length-prefixed message with a magic number from the connection.
 func (q *SocketTaskQueue) readMessage(conn net.Conn) ([]byte, error) {
 	// Read the magic number
@@ -667,7 +664,7 @@ func (q *SocketTaskQueue) readMessage(conn net.Conn) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read magic number: %w", err)
 	}
 	// Verify the magic number
-	if !bytes.Equal(receivedMagic, []byte(magicNumber)) {
+	if !bytes.Equal(receivedMagic, magicNumber) { // Use magicNumber directly
 		return nil, errInvalidMagicNumber
 	}
 
@@ -704,7 +701,7 @@ func (q *SocketTaskQueue) writeMessage(conn net.Conn, message []byte) error {
 	header := make([]byte, len(magicNumber)+4)
 
 	// Write magic number to buffer
-	copy(header[:len(magicNumber)], []byte(magicNumber))
+	copy(header[:len(magicNumber)], magicNumber) // Use magicNumber directly
 
 	// Write length to buffer (LittleEndian)
 	binary.LittleEndian.PutUint32(header[len(magicNumber):], messageLength)
