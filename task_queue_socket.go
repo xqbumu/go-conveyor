@@ -477,13 +477,3 @@ func (q *SocketTaskQueue) writeMessage(conn net.Conn, message []byte) error {
 
 	return nil
 }
-
-// TODO: Implement client-side connection logic for a different mode of operation
-// where this queue connects to a remote task queue server.
-// The current implementation assumes this queue is the server listening for connections.
-
-// TODO: Implement a proper framing protocol for sending/receiving tasks over the socket
-// to handle task boundaries correctly.
-
-// TODO: Handle different ITask implementations and their data during serialization/deserialization.
-// This might involve sending type information along with the data.
