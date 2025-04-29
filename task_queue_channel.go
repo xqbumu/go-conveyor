@@ -6,20 +6,20 @@ import (
 	"log/slog"
 )
 
-// ChannelTaskQueue implements the TaskQueue interface using a Go channel.
-type ChannelTaskQueue struct {
+// TaskQueueChannel implements the TaskQueue interface using a Go channel.
+type TaskQueueChannel struct {
 	tasks chan ITask
 }
 
 // NewChannelTaskQueue creates a new ChannelTaskQueue with the specified buffer size.
-func NewChannelTaskQueue(bufferSize int) *ChannelTaskQueue {
-	return &ChannelTaskQueue{
+func NewChannelTaskQueue(bufferSize int) *TaskQueueChannel {
+	return &TaskQueueChannel{
 		tasks: make(chan ITask, bufferSize),
 	}
 }
 
 // Push adds a task to the channel.
-func (q *ChannelTaskQueue) Push(task ITask) error {
+func (q *TaskQueueChannel) Push(task ITask) error {
 	select {
 	case q.tasks <- task:
 		slog.Debug("Task pushed to channel", "identifier", task.GetIdentify())
@@ -35,7 +35,7 @@ func (q *ChannelTaskQueue) Push(task ITask) error {
 }
 
 // Pop retrieves a task from the channel, blocking until a task is available or the context is done.
-func (q *ChannelTaskQueue) Pop(ctx context.Context) (ITask, error) {
+func (q *TaskQueueChannel) Pop(ctx context.Context) (ITask, error) {
 	select {
 	case task, ok := <-q.tasks:
 		if !ok {
@@ -53,12 +53,12 @@ func (q *ChannelTaskQueue) Pop(ctx context.Context) (ITask, error) {
 }
 
 // Len returns the current number of tasks in the channel.
-func (q *ChannelTaskQueue) Len() int {
+func (q *TaskQueueChannel) Len() int {
 	return len(q.tasks)
 }
 
 // Close closes the channel.
-func (q *ChannelTaskQueue) Close() error {
+func (q *TaskQueueChannel) Close() error {
 	slog.Info("Closing task channel")
 	close(q.tasks)
 	return nil
