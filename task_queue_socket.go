@@ -344,6 +344,53 @@ func (q *SocketTaskQueue) Len() int {
 	return 0
 }
 
+// closeConnectionHandles 关闭活动的连接句柄（基于模式）。
+// 应在设置 q.closed = true 并取消上下文后调用。
+func (q *SocketTaskQueue) closeConnectionHandles() []error {
+	q.mu.Lock()
+	var clientConnToClose net.Conn
+	var serverConnsToClose []net.Conn
+	if q.mode == "client" {
+		clientConnToClose = q.clientConn
+		q.clientConn = nil // 清除活动的客户端连接
+	} else { // 服务器模式
+		serverConnsToClose = make([]net.Conn, 0, len(q.activeConns))
+		for conn := range q.activeConns {
+			serverConnsToClose = append(serverConnsToClose, conn)
+		}
+		q.activeConns = make(map[net.Conn]struct{}) // 清除活动的服务器连接映射
+	}
+	q.mu.Unlock() // 在关闭句柄之前解锁
+
+	var connErrs []error
+	if q.mode == "client" && clientConnToClose != nil {
+		slog.Info("在 Close 期间关闭捕获的客户端连接句柄", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
+		if closeErr := clientConnToClose.Close(); closeErr != nil {
+			// 检查是否是已关闭错误
+			if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
+				connErrs = append(connErrs, fmt.Errorf("关闭客户端连接句柄失败: %w", closeErr))
+				slog.Error("关闭客户端连接句柄时出错", "error", closeErr)
+			} else {
+				slog.Debug("客户端连接句柄已并发关闭，在 Close 中忽略错误", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
+			}
+		}
+	} else if q.mode == "server" {
+		slog.Info("在 Close 期间关闭捕获的服务器连接句柄", "count", len(serverConnsToClose))
+		for _, conn := range serverConnsToClose {
+			if closeErr := conn.Close(); closeErr != nil {
+				// 检查是否是已关闭错误
+				if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
+					connErrs = append(connErrs, fmt.Errorf("关闭服务器连接句柄 (%s) 失败: %w", conn.RemoteAddr(), closeErr))
+					slog.Error("关闭服务器连接句柄时出错", "remote_addr", conn.RemoteAddr(), "error", closeErr)
+				} else {
+					slog.Debug("服务器连接句柄已并发关闭，在 Close 中忽略错误", "remote_addr", conn.RemoteAddr())
+				}
+			}
+		}
+	}
+	return connErrs
+}
+
 // Close closes the queue, stopping all goroutines and connections.
 func (q *SocketTaskQueue) Close() error {
 	q.mu.Lock()
@@ -354,70 +401,27 @@ func (q *SocketTaskQueue) Close() error {
 	q.closed = true
 	q.mu.Unlock()
 
-	slog.Info("Closing socket task queue")
+	slog.Info("正在关闭 socket 任务队列")
 
-	// Cancel the context to signal goroutines to exit
+	// 取消上下文以通知 goroutine 退出
 	q.cancel()
 
-	// Close the listener (if server mode)
-	var err error // Keep track of the first error encountered
+	// 关闭监听器（如果是服务器模式）
+	var listenerErr error
 	if q.listener != nil {
-		slog.Info("Closing listener")
+		slog.Info("正在关闭监听器")
 		if closeErr := q.listener.Close(); closeErr != nil {
-			// Assign the first error, subsequent errors will be joined later
-			err = fmt.Errorf("failed to close listener: %w", closeErr)
+			listenerErr = fmt.Errorf("关闭监听器失败: %w", closeErr)
 		}
 	}
 
-	// Capture connections to close based on mode under lock
-	q.mu.Lock()
-	var clientConnToClose net.Conn
-	var serverConnsToClose []net.Conn
-	if q.mode == "client" {
-		clientConnToClose = q.clientConn
-		q.clientConn = nil // Clear active client connection
-	} else { // server mode
-		serverConnsToClose = make([]net.Conn, 0, len(q.activeConns))
-		for conn := range q.activeConns {
-			serverConnsToClose = append(serverConnsToClose, conn)
-		}
-		q.activeConns = make(map[net.Conn]struct{}) // Clear active server connections map
-	}
-	q.mu.Unlock() // Unlock before closing handles
+	// 关闭活动的连接句柄
+	connErrs := q.closeConnectionHandles() // 调用辅助函数
 
-	// Close the captured connection handles
-	var connErrs []error
-	if q.mode == "client" && clientConnToClose != nil {
-		slog.Info("Closing client connection handle captured during Close", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
-		if closeErr := clientConnToClose.Close(); closeErr != nil {
-			if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
-				connErrs = append(connErrs, fmt.Errorf("failed to close client connection handle: %w", closeErr))
-				slog.Error("Error closing client connection handle", "error", closeErr)
-			} else {
-				slog.Debug("Client connection handle already closed concurrently, ignoring error in Close", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
-			}
-		}
-	} else if q.mode == "server" {
-		slog.Info("Closing server connection handles captured during Close", "count", len(serverConnsToClose))
-		for _, conn := range serverConnsToClose {
-			if closeErr := conn.Close(); closeErr != nil {
-				if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
-					connErrs = append(connErrs, fmt.Errorf("failed to close server connection handle (%s): %w", conn.RemoteAddr(), closeErr))
-					slog.Error("Error closing server connection handle", "remote_addr", conn.RemoteAddr(), "error", closeErr)
-				} else {
-					slog.Debug("Server connection handle already closed concurrently, ignoring error in Close", "remote_addr", conn.RemoteAddr())
-				}
-			}
-		}
-	} // End of else if q.mode == "server"
+	// 合并监听器和连接错误
+	finalErr := errors.Join(listenerErr, errors.Join(connErrs...)) // 合并所有收集到的非 nil 错误
 
-	// Combine the initial listener error (if any) and connection errors using errors.Join (Go 1.20+)
-	allErrs := []error{err} // Start with the potential listener error from the first close attempt
-	allErrs = append(allErrs, connErrs...) // Add all connection errors
-	finalErr := errors.Join(allErrs...) // Join all collected non-nil errors
-
-
-	// Close the channels to signal goroutines that read from them
+	// 关闭 channel
 	close(q.writeChan)
 	close(q.readChan)
 	slog.Debug("readChan closed by Close")
