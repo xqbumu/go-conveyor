@@ -57,9 +57,10 @@ func TestNewSocketTaskQueue_Server(t *testing.T) {
 		if q.listener == nil {
 			t.Error("Listener should not be nil in server mode")
 		}
-		if q.conn != nil {
-			t.Error("Connection should be nil initially in server mode")
-		}
+		// Server mode no longer has a single 'conn' field, uses activeConns map
+		// if q.conn != nil {
+		// 	t.Error("Connection should be nil initially in server mode")
+		// }
 		if q.addr == "" {
 			t.Error("Address should be set")
 		}
@@ -89,9 +90,10 @@ func TestNewSocketTaskQueue_Server(t *testing.T) {
 		if q.listener == nil {
 			t.Error("Listener should not be nil in server mode")
 		}
-		if q.conn != nil {
-			t.Error("Connection should be nil initially in server mode")
-		}
+		// Server mode no longer has a single 'conn' field, uses activeConns map
+		// if q.conn != nil {
+		// 	t.Error("Connection should be nil initially in server mode")
+		// }
 		if q.addr != addr {
 			t.Errorf("Address should be %s, got %s", addr, q.addr)
 		}
@@ -150,7 +152,7 @@ func TestNewSocketTaskQueue_Client(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 
 		q.mu.Lock()
-		conn := q.conn
+		conn := q.clientConn // Use clientConn for client mode
 		q.mu.Unlock()
 
 		if conn == nil {
@@ -191,10 +193,10 @@ func TestNewSocketTaskQueue_Client(t *testing.T) {
 		if q != nil {
 			defer q.Close()
 			q.mu.Lock()
-			conn := q.conn
+			conn := q.clientConn // Use clientConn for client mode
 			q.mu.Unlock()
 			if conn != nil {
-				t.Error("Connection should be nil after failed initial connection")
+				t.Error("Client connection should be nil after failed initial connection")
 			}
 		}
 	})
@@ -278,17 +280,17 @@ func TestPushPopTask(t *testing.T) {
 	// Wait for client to connect to server
 	time.Sleep(100 * time.Millisecond) // Give time for connection goroutine
 
-	// Ensure server has an active connection
+	// Ensure server has an active connection (check activeConns map)
 	serverQ.mu.Lock()
-	serverConn := serverQ.conn
+	serverHasConnection := len(serverQ.activeConns) > 0
 	serverQ.mu.Unlock()
-	if serverConn == nil {
-		t.Fatal("Server did not accept client connection")
+	if !serverHasConnection {
+		t.Fatal("Server did not accept client connection (activeConns is empty)")
 	}
 
 	// Ensure client has an active connection
 	clientQ.mu.Lock()
-	clientConn := clientQ.conn
+	clientConn := clientQ.clientConn // Use clientConn for client mode
 	clientQ.mu.Unlock()
 	if clientConn == nil {
 		t.Fatal("Client did not establish connection")
@@ -451,7 +453,7 @@ func TestPushPopOnClosedConnection(t *testing.T) {
 
 	// Get the underlying connection from the client queue
 	clientQ.mu.Lock()
-	conn := clientQ.conn
+	conn := clientQ.clientConn // Use clientConn for client mode
 	clientQ.mu.Unlock()
 
 	if conn == nil {
@@ -484,13 +486,12 @@ func TestPushPopOnClosedConnection(t *testing.T) {
 	if err == nil {
 		t.Error("Pop on closed connection did not return error")
 	} else {
-		// Expecting an error related to reading from a closed connection or queue closed
-		// The exact error might vary, so check for common patterns
-		expectedErrSubstring1 := "read: broken pipe" // Unix sockets
-		expectedErrSubstring2 := "use of closed network connection" // General
-		expectedErrSubstring3 := "Pop: queue is closed" // Due to handleConnectionClose
-		if err.Error() != expectedErrSubstring1 && err.Error() != expectedErrSubstring2 && err.Error() != expectedErrSubstring3 {
-			t.Errorf("Expected Pop error containing '%s' or '%s' or '%s', got '%v'", expectedErrSubstring1, expectedErrSubstring2, expectedErrSubstring3, err)
+		// Expecting the Pop context to time out, as the connection is closed
+		// and the server's taskChan remains open (due to multi-client support).
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Expected Pop error to be context.DeadlineExceeded, got '%v'", err)
+		} else {
+			t.Logf("Pop timed out as expected after client connection closed: %v", err)
 		}
 	}
 
@@ -500,7 +501,7 @@ func TestPushPopOnClosedConnection(t *testing.T) {
 	time.Sleep(2 * time.Second) // Wait longer than the initial reconnect delay
 
 	clientQ.mu.Lock()
-	reconnectedConn := clientQ.conn
+	reconnectedConn := clientQ.clientConn // Use clientConn for client mode
 	clientQ.mu.Unlock()
 
 	if reconnectedConn != nil {
@@ -548,7 +549,7 @@ func TestInvalidMessageHandling(t *testing.T) {
 
 	// Get the underlying connection from the client queue
 	clientQ.mu.Lock()
-	conn := clientQ.conn
+	conn := clientQ.clientConn // Use clientConn for client mode
 	clientQ.mu.Unlock()
 
 	if conn == nil {
@@ -695,17 +696,17 @@ func TestConcurrentPushPop(t *testing.T) {
 	// Wait for client to connect to server
 	time.Sleep(100 * time.Millisecond) // Give time for connection goroutine
 
-	// Ensure server has an active connection
+	// Ensure server has an active connection (check activeConns map)
 	serverQ.mu.Lock()
-	serverConn := serverQ.conn
+	serverHasConnection := len(serverQ.activeConns) > 0
 	serverQ.mu.Unlock()
-	if serverConn == nil {
-		t.Fatal("Server did not accept client connection")
+	if !serverHasConnection {
+		t.Fatal("Server did not accept client connection (activeConns is empty)")
 	}
 
 	// Ensure client has an active connection
 	clientQ.mu.Lock()
-	clientConn := clientQ.conn
+	clientConn := clientQ.clientConn // Use clientConn for client mode
 	clientQ.mu.Unlock()
 	if clientConn == nil {
 		t.Fatal("Client did not establish connection")
@@ -855,7 +856,7 @@ func TestClientReconnect(t *testing.T) {
 
 	// Verify initial connection
 	clientQ.mu.Lock()
-	initialConn := clientQ.conn
+	initialConn := clientQ.clientConn // Use clientConn for client mode
 	clientQ.mu.Unlock()
 	if initialConn == nil {
 		serverQ.Close()
@@ -874,7 +875,7 @@ func TestClientReconnect(t *testing.T) {
 
 	// Verify client connection is nil after server closure
 	clientQ.mu.Lock()
-	connAfterClose := clientQ.conn
+	connAfterClose := clientQ.clientConn // Use clientConn for client mode
 	clientQ.mu.Unlock()
 	if connAfterClose != nil {
 		t.Error("Client connection should be nil after server closure")

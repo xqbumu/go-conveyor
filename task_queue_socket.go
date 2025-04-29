@@ -27,17 +27,18 @@ func RegisterTaskType(taskType string, taskFactory func() ITask) {
 
 // SocketTaskQueue implements the TaskQueue interface using network sockets.
 type SocketTaskQueue struct {
-	listener net.Listener
-	conn     net.Conn
-	addr     string
-	network  string
-	mode     string // "server" or "client"
-	mu       sync.Mutex
-	cond     *sync.Cond // Condition variable to signal connection status changes
-	closed   bool
+	listener    net.Listener          // Server mode: listens for incoming connections
+	clientConn  net.Conn              // Client mode: the single connection to the server
+	activeConns map[net.Conn]struct{} // Server mode: tracks active client connections
+	addr        string
+	network     string
+	mode        string // "server" or "client"
+	mu          sync.Mutex // Protects clientConn, activeConns, closed, listener fields
+	cond        *sync.Cond // Condition variable to signal connection status changes (primarily for client reconnect)
+	closed      bool
 
 	// Channels for buffering tasks
-	// In server mode, this is the channel for tasks received from the client.
+	// In server mode, this is the channel for tasks received from ALL clients.
 	readChanOnce sync.Once // Ensures readChan is closed only once
 	taskChanOnce sync.Once // Ensures taskChan is closed only once
 	// In client mode, this is the channel for tasks to be sent to the server.
@@ -67,14 +68,15 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	q := &SocketTaskQueue{
-		addr:      addr,
-		network:   network,
-		mode:      mode,
-		taskChan:  make(chan ITask, 1000), // Buffered channel for tasks
-		writeChan: make(chan []byte, 1000), // Buffered channel for messages to write
-		readChan:  make(chan []byte, 1000), // Buffered channel for messages read
-		ctx:       ctx,
-		cancel:    cancel,
+		addr:        addr,
+		network:     network,
+		mode:        mode,
+		activeConns: make(map[net.Conn]struct{}), // Initialize for server mode
+		taskChan:    make(chan ITask, 1000),      // Buffered channel for tasks
+		writeChan:   make(chan []byte, 1000),    // Buffered channel for messages to write
+		readChan:    make(chan []byte, 1000),    // Buffered channel for messages read
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 
 	// Initialize condition variable for both modes
@@ -125,9 +127,9 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 			return nil, fmt.Errorf("initial client connection failed: %w", err)
 		} else {
 			q.mu.Lock()
-			q.conn = conn
+			q.clientConn = conn // Use clientConn for client mode
 			q.mu.Unlock()
-			slog.Info("Client connected successfully", "remote_addr", q.conn.RemoteAddr())
+			slog.Info("Client connected successfully", "remote_addr", q.clientConn.RemoteAddr()) // Use clientConn
 			// Signal that a connection is available
 			q.cond.Broadcast()
 			// Start reader and writer goroutines for the new connection
@@ -169,13 +171,11 @@ func (q *SocketTaskQueue) acceptConnections() {
 		}
 
 		q.mu.Lock()
-		if q.conn != nil {
-			slog.Warn("Another connection received, closing previous one")
-			q.conn.Close() // Close previous connection if a new one arrives
-		}
-		q.conn = conn
+		// Add the new connection to the map of active connections
+		q.activeConns[conn] = struct{}{}
+		slog.Info("Accepted new connection", "remote_addr", conn.RemoteAddr(), "total_connections", len(q.activeConns))
 		q.mu.Unlock()
-		slog.Info("Accepted new connection", "remote_addr", conn.RemoteAddr())
+
 		// Start reader and writer goroutines for the new connection
 		q.startConnectionGoroutines(conn)
 	}
@@ -194,7 +194,7 @@ func (q *SocketTaskQueue) reconnectClient() {
 	for {
 		q.mu.Lock()
 		closed := q.closed
-		conn := q.conn
+		conn := q.clientConn // Use clientConn for client mode check
 		q.mu.Unlock()
 
 		if closed {
@@ -236,9 +236,9 @@ func (q *SocketTaskQueue) reconnectClient() {
 		}
 
 		q.mu.Lock()
-		// Set the new connection as active, potentially overwriting an old handle.
+		// Set the new connection as active for the client.
 		// The old handle will be closed by its associated reader/writer loops when they exit.
-		q.conn = newConn
+		q.clientConn = newConn // Use clientConn for client mode
 		q.mu.Unlock()
 
 		// Let the old reader/writer loops handle closing their own connection handles via handleConnectionClose.
@@ -374,11 +374,22 @@ func (q *SocketTaskQueue) Close() error {
 		}
 	}
 
-	// Capture connection and listener handles under lock
+	// Capture listener handle under lock
 	q.mu.Lock()
-	connToClose := q.conn
 	listenerToClose := q.listener
-	q.conn = nil // Clear active connection immediately
+	// Capture connections to close based on mode
+	var clientConnToClose net.Conn
+	var serverConnsToClose []net.Conn
+	if q.mode == "client" {
+		clientConnToClose = q.clientConn
+		q.clientConn = nil // Clear active client connection
+	} else { // server mode
+		serverConnsToClose = make([]net.Conn, 0, len(q.activeConns))
+		for conn := range q.activeConns {
+			serverConnsToClose = append(serverConnsToClose, conn)
+		}
+		q.activeConns = make(map[net.Conn]struct{}) // Clear active server connections map
+	}
 	q.mu.Unlock() // Unlock before closing handles
 
 	// Cancel the context first to signal goroutines
@@ -400,21 +411,49 @@ func (q *SocketTaskQueue) Close() error {
 		}
 	}
 
-	// Close the active connection handle we captured (if any)
-	var connErr error
-	if connToClose != nil {
-		slog.Info("Closing active connection handle captured during Close", "local_addr", connToClose.LocalAddr(), "remote_addr", connToClose.RemoteAddr())
-		if closeErr := connToClose.Close(); closeErr != nil {
-			// Ignore "use of closed network connection" as it implies concurrent closure by handleConnectionClose
-			// Also ignore net.ErrClosed for similar reasons.
+	// Close the captured connection handles
+	var connErrs []error
+	if q.mode == "client" && clientConnToClose != nil {
+		slog.Info("Closing client connection handle captured during Close", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
+		if closeErr := clientConnToClose.Close(); closeErr != nil {
 			if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
-				connErr = fmt.Errorf("failed to close connection handle: %w", closeErr)
-				slog.Error("Error closing connection handle", "error", connErr)
+				connErrs = append(connErrs, fmt.Errorf("failed to close client connection handle: %w", closeErr))
+				slog.Error("Error closing client connection handle", "error", closeErr)
 			} else {
-				slog.Debug("Connection handle already closed concurrently, ignoring error in Close", "local_addr", connToClose.LocalAddr(), "remote_addr", connToClose.RemoteAddr())
+				slog.Debug("Client connection handle already closed concurrently, ignoring error in Close", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
+			}
+		}
+	} else if q.mode == "server" {
+		slog.Info("Closing server connection handles captured during Close", "count", len(serverConnsToClose))
+		for _, conn := range serverConnsToClose {
+			if closeErr := conn.Close(); closeErr != nil {
+				if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
+					connErrs = append(connErrs, fmt.Errorf("failed to close server connection handle (%s): %w", conn.RemoteAddr(), closeErr))
+					slog.Error("Error closing server connection handle", "remote_addr", conn.RemoteAddr(), "error", closeErr)
+				} else {
+					slog.Debug("Server connection handle already closed concurrently, ignoring error in Close", "remote_addr", conn.RemoteAddr())
+				}
 			}
 		}
 	}
+
+	// Combine listener and connection errors
+	if listenerErr != nil {
+		err = listenerErr // Prioritize listener error if it exists
+	}
+	if len(connErrs) > 0 {
+		// Combine multiple connection errors if necessary
+		combinedConnErr := errors.New("multiple connection close errors")
+		for _, cerr := range connErrs {
+			combinedConnErr = fmt.Errorf("%w; %w", combinedConnErr, cerr)
+		}
+		if err == nil {
+			err = combinedConnErr
+		} else {
+			err = fmt.Errorf("%w; %w", err, combinedConnErr)
+		}
+	}
+
 
 	// Close the channels to signal goroutines that read from them
 	close(q.writeChan)
@@ -617,26 +656,28 @@ func (q *SocketTaskQueue) handleConnectionClose(conn net.Conn) {
 		slog.Warn("Error closing connection handle in handleConnectionClose", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr, "error", closeErr)
 	}
 
-	// Now, check if this closed connection was the active one.
+	// Now, update the queue's state based on the mode.
 	q.mu.Lock()
-	isActive := (q.conn == conn) // Check if the handle we just closed *was* the active one
-	if isActive {
-		slog.Info("Active connection closed, clearing reference.", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr)
-		q.conn = nil       // Clear the active connection reference
-		q.cond.Broadcast() // Signal connection loss
-
-		// Server-specific logic for closing taskChan on unexpected client disconnect
-		if !q.closed && q.mode == "server" {
-			q.taskChanOnce.Do(func() {
-				close(q.taskChan)
-				slog.Debug("taskChan closed by handleConnectionClose (server mode, unexpected closure)", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr)
-			})
+	if q.mode == "client" {
+		// If this was the active client connection, clear it and signal.
+		if q.clientConn == conn {
+			slog.Info("Client active connection closed, clearing reference.", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr)
+			q.clientConn = nil
+			q.cond.Broadcast() // Signal connection loss for reconnection logic
+		} else {
+			slog.Debug("Client non-active connection handle closed.", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr)
 		}
-	} else {
-		// This means the connection handle being closed was likely from an older,
-		// already replaced connection, or the active connection was already cleared
-		// by the other loop (reader/writer) exiting first.
-		slog.Debug("Non-active connection handle closed.", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr)
+	} else { // server mode
+		// Remove the connection from the active connections map.
+		if _, ok := q.activeConns[conn]; ok {
+			delete(q.activeConns, conn)
+			slog.Info("Server connection closed, removing from active set.", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr, "remaining_connections", len(q.activeConns))
+		} else {
+			// This might happen if the connection was already removed by Close() or another concurrent close.
+			slog.Debug("Server connection handle closed, but not found in active set (already removed?).", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr)
+		}
+		// NOTE: We no longer close taskChan here in server mode.
+		// taskChan should only be closed when the entire queue is closed via Close().
 	}
 	q.mu.Unlock()
 }
