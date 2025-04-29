@@ -1,6 +1,7 @@
 package conveyor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -592,6 +593,94 @@ func TestInvalidMessageHandling(t *testing.T) {
 		}
 	}
 	// We no longer try to Pop the valid task as the connection is likely broken.
+}
+
+// TestInvalidJSONHandling tests the server's ability to handle messages
+// where the outer SocketMessage is valid JSON, but the inner TaskData is not.
+func TestInvalidJSONHandling(t *testing.T) {
+	t.Parallel()
+	serverQ, clientQ, _, cleanup := setupServerClientQueues(t, "unix")
+	defer cleanup()
+
+	// Get the underlying connection from the client queue
+	clientQ.mu.Lock()
+	conn := clientQ.clientConn
+	clientQ.mu.Unlock()
+	if conn == nil {
+		t.Fatal("Client connection is nil")
+	}
+
+	// 1. Craft a message payload with invalid JSON in TaskData
+	taskType := "conveyor.DummyTask"
+	// This string itself is invalid JSON because of the missing closing quote
+	invalidJSONPayloadString := `{"id": "invalid-json", "data": "missing quote}`
+
+	// Manually construct the outer JSON message string, embedding the invalid payload string
+	// as the value for task_data. Note that the invalidJSONPayloadString itself is the value,
+	// not a JSON string literal containing it.
+	outerJSONString := fmt.Sprintf(`{"task_type":"%s", "task_data": %s}`, taskType, invalidJSONPayloadString)
+	invalidMsgBytes := []byte(outerJSONString) // These are the bytes representing the outer JSON
+
+	// Manually prepend magic number and length (similar to writeMessage)
+	buf := new(bytes.Buffer)
+	var err error // Declare err here
+	// Write magic number
+	buf.Write([]byte(magicNumber))
+	// Write length
+	lengthBytes := make([]byte, 4)
+	messageLength := uint32(len(invalidMsgBytes))
+	lengthBytes[0] = byte(messageLength)
+	lengthBytes[1] = byte(messageLength >> 8)
+	lengthBytes[2] = byte(messageLength >> 16)
+	lengthBytes[3] = byte(messageLength >> 24)
+	buf.Write(lengthBytes)
+	// Write message body
+	buf.Write(invalidMsgBytes)
+
+	// Send the crafted invalid message directly
+	t.Log("Sending message with invalid TaskData JSON")
+	_, err = conn.Write(buf.Bytes())
+	if err != nil {
+		t.Fatalf("Failed to write invalid JSON message: %v", err)
+	}
+
+	// Give messageProcessor time to process the invalid message
+	time.Sleep(100 * time.Millisecond)
+
+	// 2. Send a subsequent valid task using Push
+	validTaskID := "valid-after-invalid-json"
+	validTask := &DummyTask{ID: validTaskID, Data: "valid data"}
+	ctxPush, cancelPush := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancelPush()
+	t.Log("Sending valid task after invalid JSON message")
+	err = clientQ.Push(ctxPush, validTask)
+	if err != nil {
+		t.Fatalf("Failed to push valid task after invalid JSON: %v", err)
+	}
+
+	// 3. Attempt to Pop the valid task from the server
+	// The server should have skipped the invalid JSON message and processed the valid one.
+	ctxPop, cancelPop := context.WithTimeout(context.Background(), 2*time.Second) // Increased timeout slightly
+	defer cancelPop()
+	t.Log("Attempting to pop the valid task")
+	poppedTask, err := serverQ.Pop(ctxPop)
+	if err != nil {
+		t.Fatalf("Expected to pop the valid task, but failed: %v", err)
+	}
+
+	// 4. Verify the popped task is the valid one
+	if poppedTask == nil {
+		t.Fatal("Popped task is nil, expected the valid task")
+	}
+	poppedDummyTask, ok := poppedTask.(*DummyTask)
+	if !ok {
+		t.Fatalf("Popped task is not *DummyTask, got %T", poppedTask)
+	}
+	if poppedDummyTask.ID != validTaskID {
+		t.Errorf("Expected popped task ID to be '%s', got '%s'", validTaskID, poppedDummyTask.ID)
+	}
+	t.Logf("Successfully popped valid task '%s' after skipping invalid JSON message.", validTaskID)
+
 }
 
 
