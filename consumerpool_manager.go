@@ -20,6 +20,7 @@ type ConsumerPoolManager struct {
 	// Resource limitation related fields
 	currentConsumers int32                      // Current number of active consumer goroutines
 	config           *ConsumerPoolManagerConfig // Configuration for the ConsumerPoolManager
+	taskQueueFactory TaskQueueFactory           // Factory function to create TaskQueue instances
 }
 
 // NewConsumerPoolManager creates and initializes a new ConsumerPoolManager instance.
@@ -30,13 +31,14 @@ func NewConsumerPoolManager(
 	taskQueueFactory TaskQueueFactory, // Add TaskQueueFactory parameter
 ) *ConsumerPoolManager {
 	cpm := &ConsumerPoolManager{
-		ctx:        ctx,
-		taskQueues: make(map[int]TaskQueue),
-		config:     config,
+		ctx:              ctx,
+		taskQueues:       make(map[int]TaskQueue),
+		config:           config,
+		taskQueueFactory: taskQueueFactory, // Store the factory
 	}
 
 	// Create a default priority (0) task queue using the factory
-	defaultQueue, err := taskQueueFactory(0, cpm.config.DefaultBufferSize)
+	defaultQueue, err := cpm.taskQueueFactory(0, cpm.config.DefaultBufferSize)
 	if err != nil {
 		slog.Error("Failed to create default task queue", "error", err)
 		return nil // Return nil if default queue creation fails
@@ -90,10 +92,16 @@ func (cpm *ConsumerPoolManager) GetOrCreateQueue(priority int, taskIdentifier st
 				return nil, err
 			}
 
-			// For now, we only support ChannelTaskQueue
-			taskQueue = NewChannelTaskQueue(defaultBufferSize)
+			// Create the new queue using the factory
+			var err error
+			taskQueue, err = cpm.taskQueueFactory(priority, defaultBufferSize)
+			if err != nil {
+				slog.Error("Failed to create task queue using factory", "priority", priority, "error", err)
+				return nil, fmt.Errorf("failed to create task queue for priority %d: %w", priority, err)
+			}
+
 			cpm.taskQueues[priority] = taskQueue
-			slog.Info("Dynamically created task queue (ChannelTaskQueue)", "priority", priority, "bufferSize", defaultBufferSize)
+			slog.Info("Dynamically created task queue using factory", "priority", priority, "bufferSize", defaultBufferSize)
 
 			// Determine the number of consumers for the newly created queue
 			numConsumersToStart, ok := cpm.config.PriorityConsumers[priority]
