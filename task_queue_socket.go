@@ -16,7 +16,10 @@ import (
 	"time"
 )
 
-var taskRegistry = make(map[string]func() ITask)
+var (
+	taskRegistry        = make(map[string]func() ITask)
+	errInvalidMagicNumber = errors.New("invalid magic number received")
+)
 
 // RegisterTaskType registers a task type with the socket task queue for deserialization.
 // The taskFactory function should return a new, empty instance of the task type.
@@ -357,18 +360,17 @@ func (q *SocketTaskQueue) Close() error {
 	q.cancel()
 
 	// Close the listener (if server mode)
-	var err error
+	var err error // Keep track of the first error encountered
 	if q.listener != nil {
 		slog.Info("Closing listener")
 		if closeErr := q.listener.Close(); closeErr != nil {
+			// Assign the first error, subsequent errors will be joined later
 			err = fmt.Errorf("failed to close listener: %w", closeErr)
 		}
 	}
 
-	// Capture listener handle under lock
+	// Capture connections to close based on mode under lock
 	q.mu.Lock()
-	listenerToClose := q.listener
-	// Capture connections to close based on mode
 	var clientConnToClose net.Conn
 	var serverConnsToClose []net.Conn
 	if q.mode == "client" {
@@ -382,22 +384,6 @@ func (q *SocketTaskQueue) Close() error {
 		q.activeConns = make(map[net.Conn]struct{}) // Clear active server connections map
 	}
 	q.mu.Unlock() // Unlock before closing handles
-
-	// Close the listener (if server mode)
-	var listenerErr error
-	if listenerToClose != nil {
-		slog.Info("Closing listener")
-		if closeErr := listenerToClose.Close(); closeErr != nil {
-			// Check if the error indicates the listener was already closed, potentially ignorable
-			// This check might need refinement based on specific OS/net errors
-			if !errors.Is(closeErr, net.ErrClosed) {
-				listenerErr = fmt.Errorf("failed to close listener: %w", closeErr)
-				slog.Error("Error closing listener", "error", listenerErr)
-			} else {
-				slog.Debug("Listener already closed, ignoring error in Close")
-			}
-		}
-	}
 
 	// Close the captured connection handles
 	var connErrs []error
@@ -423,24 +409,12 @@ func (q *SocketTaskQueue) Close() error {
 				}
 			}
 		}
-	}
+	} // End of else if q.mode == "server"
 
-	// Combine listener and connection errors
-	if listenerErr != nil {
-		err = listenerErr // Prioritize listener error if it exists
-	}
-	if len(connErrs) > 0 {
-		// Combine multiple connection errors if necessary
-		combinedConnErr := errors.New("multiple connection close errors")
-		for _, cerr := range connErrs {
-			combinedConnErr = fmt.Errorf("%w; %w", combinedConnErr, cerr)
-		}
-		if err == nil {
-			err = combinedConnErr
-		} else {
-			err = fmt.Errorf("%w; %w", err, combinedConnErr)
-		}
-	}
+	// Combine the initial listener error (if any) and connection errors using errors.Join (Go 1.20+)
+	allErrs := []error{err} // Start with the potential listener error from the first close attempt
+	allErrs = append(allErrs, connErrs...) // Add all connection errors
+	finalErr := errors.Join(allErrs...) // Join all collected non-nil errors
 
 
 	// Close the channels to signal goroutines that read from them
@@ -454,7 +428,7 @@ func (q *SocketTaskQueue) Close() error {
 	q.wg.Wait()
 
 	slog.Info("Socket task queue closed successfully")
-	return err
+	return finalErr // Return the combined error
 }
 
 // startConnectionGoroutines starts the reader and writer goroutines for a given connection.
@@ -560,14 +534,10 @@ func (q *SocketTaskQueue) readerLoop(conn net.Conn) {
 			if err == io.EOF {
 				slog.Info("Connection closed by remote peer during read", "remote_addr", conn.RemoteAddr())
 				return // Exit loop on EOF
-			}
-			// Handle specific recoverable errors differently
-			if errors.Is(err, io.EOF) {
-				slog.Info("Connection closed by remote peer during read", "remote_addr", conn.RemoteAddr())
-				return // Exit loop on EOF
-			}
-			// Check for our custom "invalid magic number" error
-			if err.Error() == "invalid magic number received" {
+			} // End of EOF check
+
+			// Check for our custom invalid magic number error
+			if errors.Is(err, errInvalidMagicNumber) {
 				slog.Warn("Received invalid magic number, skipping message", "remote_addr", conn.RemoteAddr())
 				continue // Skip this message and continue reading
 			}
@@ -686,13 +656,9 @@ func (q *SocketTaskQueue) readMessage(conn net.Conn) ([]byte, error) {
 	if _, err := io.ReadFull(conn, receivedMagic); err != nil {
 		return nil, fmt.Errorf("failed to read magic number: %w", err)
 	}
-
 	// Verify the magic number
-	if receivedMagic[0] != magicNumber[0] ||
-		receivedMagic[1] != magicNumber[1] ||
-		receivedMagic[2] != magicNumber[2] ||
-		receivedMagic[3] != magicNumber[3] {
-		return nil, errors.New("invalid magic number received")
+	if !bytes.Equal(receivedMagic, magicNumber[:]) {
+		return nil, errInvalidMagicNumber
 	}
 
 	// Read the length prefix (4 bytes for a uint32)
