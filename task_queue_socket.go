@@ -3,6 +3,7 @@ package conveyor
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"time"
 )
@@ -372,24 +372,24 @@ func (q *SocketTaskQueue) closeConnectionHandles() []error {
 	if q.mode == "client" && clientConnToClose != nil {
 		slog.Info("Closing captured client connection handle during Close", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
 		if closeErr := clientConnToClose.Close(); closeErr != nil {
-			// Check if it's a 'use of closed network connection' error
-			if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
+			// Simplify error check: net.ErrClosed should cover most "use of closed network connection" scenarios.
+			if !errors.Is(closeErr, net.ErrClosed) {
 				connErrs = append(connErrs, fmt.Errorf("failed to close client connection handle: %w", closeErr))
 				slog.Error("Error closing client connection handle", "error", closeErr)
 			} else {
-				slog.Debug("Client connection handle closed concurrently, ignoring error in Close", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
+				slog.Debug("Client connection handle already closed, ignoring error in Close", "local_addr", clientConnToClose.LocalAddr(), "remote_addr", clientConnToClose.RemoteAddr())
 			}
 		}
 	} else if q.mode == "server" {
 		slog.Info("Closing captured server connection handles during Close", "count", len(serverConnsToClose))
 		for _, conn := range serverConnsToClose {
 			if closeErr := conn.Close(); closeErr != nil {
-				// Check if it's a 'use of closed network connection' error
-				if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
+				// Simplify error check: net.ErrClosed should cover most "use of closed network connection" scenarios.
+				if !errors.Is(closeErr, net.ErrClosed) {
 					connErrs = append(connErrs, fmt.Errorf("failed to close server connection handle (%s): %w", conn.RemoteAddr(), closeErr))
 					slog.Error("Error closing server connection handle", "remote_addr", conn.RemoteAddr(), "error", closeErr)
 				} else {
-					slog.Debug("Server connection handle closed concurrently, ignoring error in Close", "remote_addr", conn.RemoteAddr())
+					slog.Debug("Server connection handle already closed, ignoring error in Close", "remote_addr", conn.RemoteAddr())
 				}
 			}
 		}
@@ -662,25 +662,29 @@ const magicNumber = "\x1A\x2B\x3C\x4D" // Use a string constant for the byte seq
 // readMessage reads a length-prefixed message with a magic number from the connection.
 func (q *SocketTaskQueue) readMessage(conn net.Conn) ([]byte, error) {
 	// Read the magic number
-	receivedMagic := make([]byte, 4)
+	receivedMagic := make([]byte, len(magicNumber)) // Use len(magicNumber)
 	if _, err := io.ReadFull(conn, receivedMagic); err != nil {
 		return nil, fmt.Errorf("failed to read magic number: %w", err)
 	}
 	// Verify the magic number
-	if !bytes.Equal(receivedMagic, []byte(magicNumber)) { // Compare with the byte representation of the constant string
+	if !bytes.Equal(receivedMagic, []byte(magicNumber)) {
 		return nil, errInvalidMagicNumber
 	}
 
-	// Read the length prefix (4 bytes for a uint32)
-	lengthBytes := make([]byte, 4)
-	if _, err := io.ReadFull(conn, lengthBytes); err != nil {
+	// Read the length prefix (uint32, LittleEndian)
+	var messageLength uint32
+	if err := binary.Read(conn, binary.LittleEndian, &messageLength); err != nil {
 		return nil, fmt.Errorf("failed to read message length: %w", err)
 	}
 
-	messageLength := uint32(lengthBytes[0]) | uint32(lengthBytes[1])<<8 | uint32(lengthBytes[2])<<16 | uint32(lengthBytes[3])<<24
-
+	// Basic sanity check for message length (optional, but good practice)
+	// Adjust the limit based on expected maximum message size.
+	const maxMessageSize = 10 * 1024 * 1024 // Example: 10MB limit
 	if messageLength == 0 {
-		return nil, errors.New("received empty message")
+		return nil, errors.New("received message with zero length")
+	}
+	if messageLength > maxMessageSize {
+		return nil, fmt.Errorf("received message length %d exceeds maximum allowed size %d", messageLength, maxMessageSize)
 	}
 
 	// Read the message payload
@@ -694,21 +698,20 @@ func (q *SocketTaskQueue) readMessage(conn net.Conn) ([]byte, error) {
 
 // writeMessage writes a length-prefixed message with a magic number to the connection.
 func (q *SocketTaskQueue) writeMessage(conn net.Conn, message []byte) error {
-	// Write the magic number
-	if _, err := conn.Write([]byte(magicNumber)); err != nil { // Write the byte representation of the constant string
-		return fmt.Errorf("failed to write magic number: %w", err)
-	}
-
 	messageLength := uint32(len(message))
-	lengthBytes := make([]byte, 4)
-	lengthBytes[0] = byte(messageLength)
-	lengthBytes[1] = byte(messageLength >> 8)
-	lengthBytes[2] = byte(messageLength >> 16)
-	lengthBytes[3] = byte(messageLength >> 24)
 
-	// Write the length prefix
-	if _, err := conn.Write(lengthBytes); err != nil {
-		return fmt.Errorf("failed to write message length: %w", err)
+	// Create a buffer for the header (magic number + length)
+	header := make([]byte, len(magicNumber)+4)
+
+	// Write magic number to buffer
+	copy(header[:len(magicNumber)], []byte(magicNumber))
+
+	// Write length to buffer (LittleEndian)
+	binary.LittleEndian.PutUint32(header[len(magicNumber):], messageLength)
+
+	// Write the header
+	if _, err := conn.Write(header); err != nil {
+		return fmt.Errorf("failed to write message header: %w", err)
 	}
 
 	// Write the message payload
