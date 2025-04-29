@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,6 +35,28 @@ type SocketTaskQueue struct {
 	mu       sync.Mutex
 	cond     *sync.Cond // Condition variable to signal connection status changes
 	closed   bool
+
+	// Channels for buffering tasks
+	// In server mode, this is the channel for tasks received from the client.
+	readChanOnce sync.Once // Ensures readChan is closed only once
+	taskChanOnce sync.Once // Ensures taskChan is closed only once
+	// In client mode, this is the channel for tasks to be sent to the server.
+	taskChan chan ITask
+
+	// Channel for messages to be sent over the socket
+	// This is used internally by the writer goroutine.
+	writeChan chan []byte
+
+	// Channel for received messages from the socket
+	// This is used internally by the reader goroutine.
+	readChan chan []byte
+
+	// WaitGroup to wait for goroutines to finish
+	wg sync.WaitGroup
+
+	// Context for managing goroutine lifecycle
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewSocketTaskQueue creates a new SocketTaskQueue.
@@ -41,10 +64,17 @@ type SocketTaskQueue struct {
 // network should be "tcp" or "unix".
 // addr is the address to listen on (server) or connect to (client).
 func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	q := &SocketTaskQueue{
-		addr:    addr,
-		network: network,
-		mode:    mode,
+		addr:      addr,
+		network:   network,
+		mode:      mode,
+		taskChan:  make(chan ITask, 1000), // Buffered channel for tasks
+		writeChan: make(chan []byte, 1000), // Buffered channel for messages to write
+		readChan:  make(chan []byte, 1000), // Buffered channel for messages read
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
 	// Initialize condition variable for both modes
@@ -59,7 +89,6 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 				return nil, fmt.Errorf("failed to listen on tcp %s: %w", addr, err)
 			}
 			slog.Info("Server listening on tcp", "addr", q.listener.Addr().String())
-			go q.acceptConnections() // Start accepting connections
 		} else if network == "unix" {
 			// Check if socket file exists and remove it
 			if _, err := os.Stat(addr); err == nil {
@@ -73,17 +102,21 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 				return nil, fmt.Errorf("failed to listen on unix %s: %w", addr, err)
 			}
 			slog.Info("Server listening on unix", "addr", addr)
-			go q.acceptConnections() // Start accepting connections
 		} else {
 			return nil, fmt.Errorf("server mode unsupported network type: %s", network)
 		}
+		go q.acceptConnections() // Start accepting connections
+		// Start the goroutine to process received messages and put them into taskChan
+		q.wg.Add(1)
+		go q.messageProcessor()
+
 	case "client":
 		slog.Info("Client connecting to", "network", network, "addr", addr)
 		// Seed random for jitter in reconnection
 		rand.Seed(time.Now().UnixNano())
 
 		// Attempt initial connection
-		q.conn, err = net.Dial(network, addr)
+		conn, err := net.Dial(network, addr)
 		if err != nil {
 			slog.Error("Initial client connection failed", "error", err)
 			// Start reconnect goroutine even if initial connection fails
@@ -91,19 +124,35 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 			// Return error to the caller if initial connection fails
 			return nil, fmt.Errorf("initial client connection failed: %w", err)
 		} else {
+			q.mu.Lock()
+			q.conn = conn
+			q.mu.Unlock()
 			slog.Info("Client connected successfully", "remote_addr", q.conn.RemoteAddr())
 			// Signal that a connection is available
 			q.cond.Broadcast()
+			// Start reader and writer goroutines for the new connection
+			q.startConnectionGoroutines(conn)
 		}
 
 		// Always start client reconnection logic in a goroutine
 		go q.reconnectClient()
+
+		// Start the goroutine to process received messages and put them into taskChan
+		q.wg.Add(1)
+		go q.messageProcessor()
 
 		// Return the queue instance on successful initial connection
 		return q, nil
 	default:
 		return nil, fmt.Errorf("unsupported mode: %s, must be 'server' or 'client'", mode)
 	}
+
+	// Start the goroutine to process received messages and put them into taskChan for server mode as well
+	if mode == "server" {
+		q.wg.Add(1)
+		go q.messageProcessor()
+	}
+
 
 	return q, nil
 }
@@ -127,9 +176,8 @@ func (q *SocketTaskQueue) acceptConnections() {
 		q.conn = conn
 		q.mu.Unlock()
 		slog.Info("Accepted new connection", "remote_addr", conn.RemoteAddr())
-		// Handle the connection in a goroutine if needed for concurrent operations,
-		// but for a simple queue, one connection might be sufficient.
-		// For now, we assume one active connection at a time.
+		// Start reader and writer goroutines for the new connection
+		q.startConnectionGoroutines(conn)
 	}
 }
 
@@ -188,43 +236,48 @@ func (q *SocketTaskQueue) reconnectClient() {
 		}
 
 		q.mu.Lock()
+		// Set the new connection as active, potentially overwriting an old handle.
+		// The old handle will be closed by its associated reader/writer loops when they exit.
 		q.conn = newConn
 		q.mu.Unlock()
+
+		// Let the old reader/writer loops handle closing their own connection handles via handleConnectionClose.
+		// No need to explicitly close oldConn here. If oldConn exists and is different from newConn,
+		// its associated goroutines should have already exited or will exit due to the original disconnection,
+		// triggering handleConnectionClose(oldConn).
+
 		slog.Info("Client reconnected successfully", "remote_addr", newConn.RemoteAddr())
 
-		// Signal that a connection is available
+		// Give the server/network a brief moment after establishing the connection
+		// before starting goroutines that might immediately try to use it.
+		// This might help mitigate potential race conditions where the connection
+		// Start reader and writer goroutines IMMEDIATELY for the new connection
+		q.startConnectionGoroutines(newConn)
+
+		// Give loops a moment to start before signaling/proceeding.
+		// This helps ensure that if the connection fails immediately,
+		// the loops have a chance to run, fail, and call handleConnectionClose
+		// to reset q.conn before the test or other logic might incorrectly
+		// assume the connection is stable just because q.conn was briefly set.
+		time.Sleep(100 * time.Millisecond) // Shorter delay after starting loops
+
+		// Signal that a connection is potentially available (loops might fail quickly)
 		q.cond.Broadcast()
 
-		// Reset delay on successful connection
+		// Reset delay on successful connection attempt (loops might still fail later)
 		currentDelay = initialDelay
 	}
 }
 
 // Push adds a task to the queue by sending it over the socket.
-// It waits for a connection to be available, respecting the context deadline.
+// It marshals the task and sends the message bytes to the internal write channel.
 func (q *SocketTaskQueue) Push(ctx context.Context, task ITask) error {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	// Wait for a connection if none is available
-	for q.conn == nil && !q.closed {
-		slog.Debug("Push: Waiting for connection")
-		// Wait for signal or context cancellation
-		select {
-		case <-ctx.Done():
-			slog.Debug("Push: Context done while waiting for connection", "error", ctx.Err())
-			return fmt.Errorf("Push: context done while waiting for connection: %w", ctx.Err())
-		default:
-			// Wait on the condition variable. This releases the mutex and re-acquires it when signaled.
-			q.cond.Wait()
-		}
-	}
-
 	if q.closed {
+		q.mu.Unlock()
 		return errors.New("Push: queue is closed")
 	}
-
-	conn := q.conn // Use the established connection
+	q.mu.Unlock()
 
 	// Marshal the task data into json.RawMessage
 	taskDataBytes, err := json.Marshal(task)
@@ -252,117 +305,40 @@ func (q *SocketTaskQueue) Push(ctx context.Context, task ITask) error {
 		return fmt.Errorf("Push: failed to marshal socket message for task %s: %w", task.GetIdentify(), err)
 	}
 
-	// Send the length-prefixed message
-	if err := q.writeMessage(conn, messageBytes); err != nil {
-		slog.Error("Failed to write message to connection", "identifier", task.GetIdentify(), "error", err)
-		// Consider closing the connection on write errors if they are persistent
-		return fmt.Errorf("Push: failed to write message to connection for task %s: %w", task.GetIdentify(), err)
+	// Send the message bytes to the write channel
+	select {
+	case q.writeChan <- messageBytes:
+		slog.Debug("Task marshaled and sent to writeChan", "identifier", task.GetIdentify())
+		return nil
+	case <-ctx.Done():
+		slog.Debug("Push: Context done while sending to writeChan", "error", ctx.Err())
+		return fmt.Errorf("Push: context done while sending to writeChan: %w", ctx.Err())
+	case <-q.ctx.Done():
+		slog.Debug("Push: Queue context done while sending to writeChan, queue is closing")
+		return errors.New("Push: queue is closing")
 	}
-
-	slog.Debug("Task pushed over socket", "identifier", task.GetIdentify())
-	return nil
 }
 
-// Pop retrieves a task from the queue by reading from the socket.
-// It waits for a connection to be available and reads with the context deadline.
+// Pop retrieves a task from the queue by reading from the internal task channel.
+// It waits for a task to be available, respecting the context deadline.
 func (q *SocketTaskQueue) Pop(ctx context.Context) (ITask, error) {
 	var zero ITask // Declare zero value for ITask
 
-	q.mu.Lock()
-	// Wait for a connection if none is available
-	for q.conn == nil && !q.closed {
-		slog.Debug("Pop: Waiting for connection")
-		// Wait for signal or context cancellation
-		select {
-		case <-ctx.Done():
-			slog.Debug("Pop: Context done while waiting for connection", "error", ctx.Err())
-			q.mu.Unlock()
-			return zero, fmt.Errorf("Pop: context done while waiting for connection: %w", ctx.Err())
-		default:
-			// Wait on the condition variable. This releases the mutex and re-acquires it when signaled.
-			q.cond.Wait()
+	select {
+	case task, ok := <-q.taskChan:
+		if !ok {
+			slog.Debug("taskChan closed, Pop returning closed error")
+			return zero, errors.New("Pop: queue is closed")
 		}
+		slog.Debug("Task received from taskChan", "identifier", task.GetIdentify())
+		return task, nil
+	case <-ctx.Done():
+		slog.Debug("Pop: Context done while waiting for task", "error", ctx.Err())
+		return zero, fmt.Errorf("Pop: context done while waiting for task: %w", ctx.Err())
+	case <-q.ctx.Done():
+		slog.Debug("Pop: Queue context done while waiting for task, queue is closing")
+		return zero, errors.New("Pop: queue is closing")
 	}
-
-	if q.closed {
-		q.mu.Unlock()
-		return zero, errors.New("Pop: queue is closed")
-	}
-
-	conn := q.conn // Use the established connection
-	q.mu.Unlock() // Release mutex before reading
-
-	// Read the length-prefixed message
-	// Use a deadline from the context for the read operation
-	// Note: SetReadDeadline applies to the connection, not just this read.
-	// A more robust solution might involve a background reader goroutine.
-	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetReadDeadline(deadline)
-	} else {
-		// Set a default short deadline if context has no deadline, to avoid blocking indefinitely
-		// This default deadline is important for the Pop method to be non-blocking if no task is available.
-		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	}
-
-	messageBytes, err := q.readMessage(conn)
-	// Clear the deadline after the read attempt
-	conn.SetReadDeadline(time.Time{})
-
-	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			// Timeout, no data available within the deadline
-			return zero, context.DeadlineExceeded // Signal no task available within the deadline
-		}
-		if err == io.EOF {
-			slog.Info("Connection closed by remote peer during Pop read")
-			q.mu.Lock()
-			q.conn = nil // Clear the connection
-			q.cond.Broadcast() // Signal connection status change
-			q.mu.Unlock()
-			return zero, errors.New("Pop: connection closed by remote peer")
-		}
-		slog.Error("Failed to read message from connection during Pop", "error", err)
-		// Consider closing the connection on read errors if they are persistent
-		q.mu.Lock()
-		q.conn = nil // Clear the connection on read error
-		q.cond.Broadcast() // Signal connection status change
-		q.mu.Unlock()
-		return zero, fmt.Errorf("Pop: failed to read message from connection: %w", err)
-	}
-
-	// Unmarshal the SocketMessage with stricter checking
-	var message SocketMessage
-	decoder := json.NewDecoder(bytes.NewReader(messageBytes))
-	decoder.DisallowUnknownFields() // Disallow unknown fields in the SocketMessage itself
-	if err := decoder.Decode(&message); err != nil {
-		slog.Error("Failed to unmarshal socket message during Pop (strict)", "error", err)
-		// This indicates a malformed message or unexpected fields.
-		return zero, fmt.Errorf("Pop: failed to unmarshal socket message (strict): %w", err)
-	}
-
-	// Use the message.TaskType to determine the concrete task type
-	// and unmarshal message.TaskData into an instance of that type.
-	taskFactory, ok := taskRegistry[message.TaskType]
-	if !ok {
-		slog.Error("Unknown task type received during Pop", "type", message.TaskType)
-		// This indicates a protocol mismatch or missing registration.
-		// Could potentially close the connection or log and skip the message.
-		// Returning an error for now.
-		return zero, fmt.Errorf("Pop: unknown task type: %s", message.TaskType)
-	}
-
-	task := taskFactory()
-	// Unmarshal the task data into the concrete type with stricter checking
-	taskDecoder := json.NewDecoder(bytes.NewReader(message.TaskData))
-	taskDecoder.DisallowUnknownFields() // Disallow unknown fields in the task data
-	if err := taskDecoder.Decode(task); err != nil {
-		slog.Error("Failed to unmarshal task data into concrete type during Pop (strict)", "type", message.TaskType, "error", err)
-		// This indicates the task data doesn't match the expected type structure or has unexpected fields.
-		return zero, fmt.Errorf("Pop: failed to unmarshal task data for type %s (strict): %w", message.TaskType, err)
-	}
-
-	slog.Debug("Task popped and deserialized", "type", message.TaskType, "identifier", task.GetIdentify())
-	return task, nil
 }
 
 // Len returns the current number of tasks in the queue.
@@ -374,36 +350,295 @@ func (q *SocketTaskQueue) Len() int {
 	return 0
 }
 
-// Close closes the listener and any active connection.
+// Close closes the queue, stopping all goroutines and connections.
 func (q *SocketTaskQueue) Close() error {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-
 	if q.closed {
+		q.mu.Unlock()
 		return nil
 	}
 	q.closed = true
-	// Signal any waiting goroutines that the queue is closed
-	q.cond.Broadcast()
+	q.mu.Unlock()
 
 	slog.Info("Closing socket task queue")
 
+	// Cancel the context to signal goroutines to exit
+	q.cancel()
+
+	// Close the listener (if server mode)
 	var err error
 	if q.listener != nil {
 		slog.Info("Closing listener")
-		err = q.listener.Close()
-	}
-
-	if q.conn != nil {
-		slog.Info("Closing connection")
-		connErr := q.conn.Close()
-		if err == nil { // Only set err if listener close didn't already set it
-			err = connErr
+		if closeErr := q.listener.Close(); closeErr != nil {
+			err = fmt.Errorf("failed to close listener: %w", closeErr)
 		}
-		q.conn = nil // Clear the connection on close
 	}
 
+	// Capture connection and listener handles under lock
+	q.mu.Lock()
+	connToClose := q.conn
+	listenerToClose := q.listener
+	q.conn = nil // Clear active connection immediately
+	q.mu.Unlock() // Unlock before closing handles
+
+	// Cancel the context first to signal goroutines
+	q.cancel()
+
+	// Close the listener (if server mode)
+	var listenerErr error
+	if listenerToClose != nil {
+		slog.Info("Closing listener")
+		if closeErr := listenerToClose.Close(); closeErr != nil {
+			// Check if the error indicates the listener was already closed, potentially ignorable
+			// This check might need refinement based on specific OS/net errors
+			if !errors.Is(closeErr, net.ErrClosed) {
+				listenerErr = fmt.Errorf("failed to close listener: %w", closeErr)
+				slog.Error("Error closing listener", "error", listenerErr)
+			} else {
+				slog.Debug("Listener already closed, ignoring error in Close")
+			}
+		}
+	}
+
+	// Close the active connection handle we captured (if any)
+	var connErr error
+	if connToClose != nil {
+		slog.Info("Closing active connection handle captured during Close", "local_addr", connToClose.LocalAddr(), "remote_addr", connToClose.RemoteAddr())
+		if closeErr := connToClose.Close(); closeErr != nil {
+			// Ignore "use of closed network connection" as it implies concurrent closure by handleConnectionClose
+			// Also ignore net.ErrClosed for similar reasons.
+			if !errors.Is(closeErr, net.ErrClosed) && !strings.Contains(closeErr.Error(), "use of closed network connection") {
+				connErr = fmt.Errorf("failed to close connection handle: %w", closeErr)
+				slog.Error("Error closing connection handle", "error", connErr)
+			} else {
+				slog.Debug("Connection handle already closed concurrently, ignoring error in Close", "local_addr", connToClose.LocalAddr(), "remote_addr", connToClose.RemoteAddr())
+			}
+		}
+	}
+
+	// Close the channels to signal goroutines that read from them
+	close(q.writeChan)
+	// Use sync.Once to ensure readChan is closed only once
+	q.readChanOnce.Do(func() {
+		close(q.readChan)
+		slog.Debug("readChan closed by Close")
+	})
+	// Use sync.Once to ensure taskChan is closed only once
+	q.taskChanOnce.Do(func() {
+		close(q.taskChan)
+		slog.Debug("taskChan closed by Close")
+	})
+
+	// Wait for all goroutines to finish
+	q.wg.Wait()
+
+	slog.Info("Socket task queue closed successfully")
 	return err
+}
+
+// startConnectionGoroutines starts the reader and writer goroutines for a given connection.
+func (q *SocketTaskQueue) startConnectionGoroutines(conn net.Conn) {
+	q.wg.Add(2) // Add 2 to the WaitGroup for reader and writer goroutines
+	go q.readerLoop(conn)
+	go q.writerLoop(conn)
+}
+
+// messageProcessor reads raw message bytes from readChan, deserializes them,
+// and sends the resulting ITask to taskChan.
+func (q *SocketTaskQueue) messageProcessor() {
+	defer q.wg.Done()
+	slog.Info("Message processor started")
+
+	for {
+		select {
+		case messageBytes, ok := <-q.readChan:
+			if !ok {
+				slog.Debug("readChan closed, message processor exiting")
+				return // readChan is closed, exit
+			}
+
+			// Unmarshal the SocketMessage with stricter checking
+			var message SocketMessage
+			// It's better to handle JSON decoding errors here in the messageProcessor
+			// as the readerLoop just deals with raw bytes.
+			decoder := json.NewDecoder(bytes.NewReader(messageBytes))
+			decoder.DisallowUnknownFields() // Disallow unknown fields in the SocketMessage itself
+			if err := decoder.Decode(&message); err != nil {
+				slog.Error("Failed to unmarshal socket message in message processor (strict)", "error", err, "raw_bytes", string(messageBytes))
+				// If the core SocketMessage structure is invalid, we can't proceed with this message.
+				continue // Skip this message and continue processing
+			}
+
+
+			// Use the message.TaskType to determine the concrete task type
+			// and unmarshal message.TaskData into an instance of that type.
+			taskFactory, ok := taskRegistry[message.TaskType]
+			if !ok {
+				slog.Error("Unknown task type received in message processor", "type", message.TaskType)
+				// Continue processing next message on unknown type
+				continue
+			}
+
+			task := taskFactory()
+			// Unmarshal the task data into the concrete type with stricter checking
+			taskDecoder := json.NewDecoder(bytes.NewReader(message.TaskData))
+			taskDecoder.DisallowUnknownFields() // Disallow unknown fields in the task data
+			if err := taskDecoder.Decode(task); err != nil {
+				slog.Error("Failed to unmarshal task data into concrete type in message processor (strict)", "type", message.TaskType, "error", err)
+				// Continue processing next message on unmarshal error
+				continue
+			}
+
+			slog.Debug("Task deserialized and sending to taskChan", "type", message.TaskType, "identifier", task.GetIdentify())
+
+			// Send the deserialized task to the taskChan
+			select {
+			case q.taskChan <- task:
+				slog.Debug("Task sent to taskChan", "identifier", task.GetIdentify())
+			case <-q.ctx.Done():
+				slog.Debug("Message processor context done while sending to taskChan, exiting")
+				return
+			}
+
+		case <-q.ctx.Done():
+			slog.Debug("Message processor context done, exiting")
+			return
+		}
+	}
+}
+
+// readerLoop reads messages from the connection and sends them to the readChan.
+func (q *SocketTaskQueue) readerLoop(conn net.Conn) {
+	defer q.wg.Done()
+	defer func() {
+		slog.Info("Reader loop exiting", "remote_addr", conn.RemoteAddr())
+		// When reader loop exits, it means the connection is broken or closed.
+		// We should close the connection and signal for reconnection (if client).
+		q.handleConnectionClose(conn)
+	}()
+
+	slog.Info("Reader loop started", "remote_addr", conn.RemoteAddr())
+	slog.Debug("Reader loop running for connection", "local_addr", conn.LocalAddr(), "remote_addr", conn.RemoteAddr()) // Add detailed log
+
+	for {
+		// Check if the queue is closed or context is done
+		select {
+		case <-q.ctx.Done():
+			slog.Debug("Reader loop context done, exiting")
+			return
+		default:
+			// Continue reading
+		}
+
+		messageBytes, err := q.readMessage(conn)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Read timeout, continue loop to check context/closed status
+				continue
+			}
+			if err == io.EOF {
+				slog.Info("Connection closed by remote peer during read", "remote_addr", conn.RemoteAddr())
+				return // Exit loop on EOF
+			}
+			// Handle specific recoverable errors differently
+			if errors.Is(err, io.EOF) {
+				slog.Info("Connection closed by remote peer during read", "remote_addr", conn.RemoteAddr())
+				return // Exit loop on EOF
+			}
+			// Check for our custom "invalid magic number" error
+			if err.Error() == "invalid magic number received" {
+				slog.Warn("Received invalid magic number, skipping message", "remote_addr", conn.RemoteAddr())
+				continue // Skip this message and continue reading
+			}
+			// Check for other potentially recoverable errors (e.g., temporary network issues?)
+			// For now, treat other errors as fatal for this connection.
+			slog.Error("Failed to read message in reader loop", "error", err, "remote_addr", conn.RemoteAddr())
+			return // Exit loop on other fatal errors
+		}
+
+		// Send the received message bytes to the readChan
+		select {
+		case q.readChan <- messageBytes:
+			slog.Debug("Message read and sent to readChan", "remote_addr", conn.RemoteAddr(), "size", len(messageBytes))
+		case <-q.ctx.Done():
+			slog.Debug("Reader loop context done while sending to readChan, exiting")
+			return
+		}
+	}
+}
+
+// writerLoop reads messages from the writeChan and writes them to the connection.
+func (q *SocketTaskQueue) writerLoop(conn net.Conn) {
+	defer q.wg.Done()
+	defer func() {
+		slog.Info("Writer loop exiting", "remote_addr", conn.RemoteAddr())
+		// When writer loop exits, it means the connection is broken or closed.
+		// We should close the connection and signal for reconnection (if client).
+		q.handleConnectionClose(conn)
+	}()
+
+	slog.Info("Writer loop started", "remote_addr", conn.RemoteAddr())
+	slog.Debug("Writer loop running for connection", "local_addr", conn.LocalAddr(), "remote_addr", conn.RemoteAddr()) // Add detailed log
+
+	for {
+		select {
+		case messageBytes, ok := <-q.writeChan:
+			if !ok {
+				slog.Debug("writeChan closed, writer loop exiting")
+				return // writeChan is closed, exit
+			}
+			if err := q.writeMessage(conn, messageBytes); err != nil {
+				slog.Error("Failed to write message in writer loop", "error", err, "remote_addr", conn.RemoteAddr())
+				return // Exit loop on write error
+			}
+			slog.Debug("Message written to connection", "remote_addr", conn.RemoteAddr(), "size", len(messageBytes))
+		case <-q.ctx.Done():
+			slog.Debug("Writer loop context done, exiting")
+			return
+		}
+	}
+}
+
+// handleConnectionClose is called when a reader or writer loop exits due to error or closure.
+// It ensures the specific connection handle used by that loop is closed,
+// and if it was the active connection, it clears the reference and signals.
+func (q *SocketTaskQueue) handleConnectionClose(conn net.Conn) {
+	// Get addresses before closing, as they might become unavailable after.
+	connRemoteAddr := conn.RemoteAddr()
+	connLocalAddr := conn.LocalAddr()
+
+	// Close the specific connection handle associated with the exiting goroutine.
+	// Do this outside the lock.
+	slog.Debug("Closing connection handle in handleConnectionClose", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr)
+	closeErr := conn.Close() // Close the handle passed by the exiting goroutine
+	if closeErr != nil {
+		// Log error but continue, as we still need to update internal state.
+		// Use Warn level as it's potentially problematic but might be expected if already closed.
+		slog.Warn("Error closing connection handle in handleConnectionClose", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr, "error", closeErr)
+	}
+
+	// Now, check if this closed connection was the active one.
+	q.mu.Lock()
+	isActive := (q.conn == conn) // Check if the handle we just closed *was* the active one
+	if isActive {
+		slog.Info("Active connection closed, clearing reference.", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr)
+		q.conn = nil       // Clear the active connection reference
+		q.cond.Broadcast() // Signal connection loss
+
+		// Server-specific logic for closing taskChan on unexpected client disconnect
+		if !q.closed && q.mode == "server" {
+			q.taskChanOnce.Do(func() {
+				close(q.taskChan)
+				slog.Debug("taskChan closed by handleConnectionClose (server mode, unexpected closure)", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr)
+			})
+		}
+	} else {
+		// This means the connection handle being closed was likely from an older,
+		// already replaced connection, or the active connection was already cleared
+		// by the other loop (reader/writer) exiting first.
+		slog.Debug("Non-active connection handle closed.", "local_addr", connLocalAddr, "remote_addr", connRemoteAddr)
+	}
+	q.mu.Unlock()
 }
 
 func (q *SocketTaskQueue) isClosed() bool {
