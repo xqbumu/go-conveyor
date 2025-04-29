@@ -47,6 +47,9 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 		mode:    mode,
 	}
 
+	// Initialize condition variable for both modes
+	q.cond = sync.NewCond(&q.mu)
+
 	var err error
 	switch mode {
 	case "server":
@@ -55,7 +58,7 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to listen on tcp %s: %w", addr, err)
 			}
-			slog.Info("Server listening on tcp", "addr", addr)
+			slog.Info("Server listening on tcp", "addr", q.listener.Addr().String())
 			go q.acceptConnections() // Start accepting connections
 		} else if network == "unix" {
 			// Check if socket file exists and remove it
@@ -102,8 +105,6 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 		return nil, fmt.Errorf("unsupported mode: %s, must be 'server' or 'client'", mode)
 	}
 
-	// Initialize condition variable for both modes
-	q.cond = sync.NewCond(&q.mu)
 	return q, nil
 }
 
@@ -232,9 +233,15 @@ func (q *SocketTaskQueue) Push(ctx context.Context, task ITask) error {
 		return fmt.Errorf("Push: failed to marshal task data for task %s: %w", task.GetIdentify(), err)
 	}
 
+	// Get the task type name, handling pointers
+	taskType := fmt.Sprintf("%T", task.GetType())
+	if taskType[0] == '*' {
+		taskType = taskType[1:] // Remove the leading '*' for pointer types
+	}
+
 	// Create a SocketMessage
 	message := SocketMessage{
-		TaskType: fmt.Sprintf("%T", task.GetType()), // Use fmt.Sprintf("%T", ...) to get the type name
+		TaskType: taskType,
 		TaskData: json.RawMessage(taskDataBytes),
 	}
 
