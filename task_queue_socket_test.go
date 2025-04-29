@@ -49,8 +49,8 @@ func init() {
 func TestNewSocketTaskQueue_Server(t *testing.T) {
 	t.Parallel() // Mark test as parallelizable
 	t.Run("tcp server", func(t *testing.T) {
-		addr := "127.0.0.1:0" // Use port 0 to get a random available port
-		q, err := NewSocketTaskQueue("server", "tcp", addr)
+		addr := "127.0.0.1:0"                                    // Use port 0 to get a random available port
+		q, err := NewSocketTaskQueue("server", "tcp", addr, nil) // Add nil for options
 		if err != nil {
 			t.Fatalf("Failed to create TCP server queue: %v", err)
 		}
@@ -83,7 +83,7 @@ func TestNewSocketTaskQueue_Server(t *testing.T) {
 		defer os.RemoveAll(tmpDir) // Clean up the temp directory
 
 		addr := fmt.Sprintf("%s/test.sock", tmpDir)
-		q, err := NewSocketTaskQueue("server", "unix", addr)
+		q, err := NewSocketTaskQueue("server", "unix", addr, nil) // Add nil for options
 		if err != nil {
 			t.Fatalf("Failed to create Unix server queue: %v", err)
 		}
@@ -113,7 +113,7 @@ func TestNewSocketTaskQueue_Server(t *testing.T) {
 	})
 
 	t.Run("unsupported network server", func(t *testing.T) {
-		_, err := NewSocketTaskQueue("server", "udp", "127.0.0.1:0")
+		_, err := NewSocketTaskQueue("server", "udp", "127.0.0.1:0", nil) // Add nil for options
 		if err == nil {
 			t.Error("Expected error for unsupported network type")
 		} else if err.Error() != "server mode unsupported network type: udp" {
@@ -122,7 +122,7 @@ func TestNewSocketTaskQueue_Server(t *testing.T) {
 	})
 
 	t.Run("unsupported mode", func(t *testing.T) {
-		_, err := NewSocketTaskQueue("worker", "tcp", "127.0.0.1:0")
+		_, err := NewSocketTaskQueue("worker", "tcp", "127.0.0.1:0", nil) // Add nil for options
 		if err == nil {
 			t.Error("Expected error for unsupported mode")
 		} else if err.Error() != "unsupported mode: worker, must be 'server' or 'client'" {
@@ -134,7 +134,7 @@ func TestNewSocketTaskQueue_Server(t *testing.T) {
 func TestNewSocketTaskQueue_Client(t *testing.T) {
 	// Start a dummy server first
 	serverAddr := "127.0.0.1:0"
-	serverQ, err := NewSocketTaskQueue("server", "tcp", serverAddr)
+	serverQ, err := NewSocketTaskQueue("server", "tcp", serverAddr, nil) // Add nil for options
 	if err != nil {
 		t.Fatalf("Failed to create dummy server: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestNewSocketTaskQueue_Client(t *testing.T) {
 	actualServerAddr := serverQ.listener.Addr().String()
 
 	t.Run("tcp client connects to server", func(t *testing.T) {
-		q, err := NewSocketTaskQueue("client", "tcp", actualServerAddr)
+		q, err := NewSocketTaskQueue("client", "tcp", actualServerAddr, nil) // Add nil for options
 		if err != nil {
 			t.Fatalf("Failed to create TCP client queue: %v", err)
 		}
@@ -177,7 +177,7 @@ func TestNewSocketTaskQueue_Client(t *testing.T) {
 	t.Run("client fails to connect to non-existent server", func(t *testing.T) {
 		// Use an address that is unlikely to have a server
 		nonExistentAddr := "127.0.0.1:54321"
-		q, err := NewSocketTaskQueue("client", "tcp", nonExistentAddr)
+		q, err := NewSocketTaskQueue("client", "tcp", nonExistentAddr, nil) // Add nil for options
 		if err == nil {
 			t.Error("Expected error when connecting to non-existent server")
 		} else {
@@ -222,38 +222,38 @@ func isConnectionRefused(err error) bool {
 	}
 	// Fallback check for error string (less reliable)
 	return unwrappedErr != nil && (
-		// Common error messages across different platforms/Go versions
-		// "connection refused" is common on Linux/macOS
-		// "connectex: No connection could be made because the target machine actively refused it." is common on Windows
-		// "dial tcp 127.0.0.1:54321: connect: connection refused" is a common format
-		// "dial tcp [::1]:54321: connect: connection refused" (IPv6)
-		// "dial tcp 127.0.0.1:54321: wsarefused" (Windows specific)
-		// "dial tcp 127.0.0.1:54321: i/o timeout" (could happen if firewall blocks or server is slow to respond)
-		// "dial tcp 127.0.0.1:54321: no route to host" (network configuration issue)
-		// We'll focus on the most common "connection refused" pattern for simplicity in this test helper.
-		// A more robust check might inspect the underlying error type more deeply or use platform-specific checks.
-		// For this test, a simple string contains check is often sufficient to indicate the intended failure.
-		// However, relying on string matching is fragile. Let's stick to checking the OpError/SyscallError structure first.
-		// If the structured check fails, we can add specific string checks if necessary, but it's less ideal.
-		// Let's refine the structured check.
-		// The error from net.Dial on connection refused is typically *net.OpError with a *os.SyscallError inside.
-		// The SyscallError's Err field is a syscall.Errno or similar platform-specific error value.
-		// We need to check the *value* of this error, not just its string representation, if possible.
-		// However, accessing syscall.Errno values directly is platform-dependent.
-		// The string representation is often the most portable way to check for specific *types* of network errors
-		// when the underlying error value isn't easily accessible or comparable across platforms.
-		// Let's add a robust string check as a fallback, acknowledging its limitations.
-		// A better approach might be to use a library or a more comprehensive set of checks for network errors.
-		// For this test, let's keep it simple and check for the common string pattern.
-		// This is a compromise between robustness and simplicity for a test helper.
-		// If tests fail on a specific platform due to different error messages, this helper might need refinement.
-		unwrappedErr.Error() == "connection refused" ||
-			unwrappedErr.Error() == "connect: connection refused" ||
-			unwrappedErr.Error() == "dial tcp: connect: connection refused" || // Common format
-			unwrappedErr.Error() == "dial unix: connect: connection refused" || // Unix socket format
-			// Add other common patterns if needed based on test failures on different platforms
-			// e.g., strings.Contains(err.Error(), "connection refused")
-			false)
+	// Common error messages across different platforms/Go versions
+	// "connection refused" is common on Linux/macOS
+	// "connectex: No connection could be made because the target machine actively refused it." is common on Windows
+	// "dial tcp 127.0.0.1:54321: connect: connection refused" is a common format
+	// "dial tcp [::1]:54321: connect: connection refused" (IPv6)
+	// "dial tcp 127.0.0.1:54321: wsarefused" (Windows specific)
+	// "dial tcp 127.0.0.1:54321: i/o timeout" (could happen if firewall blocks or server is slow to respond)
+	// "dial tcp 127.0.0.1:54321: no route to host" (network configuration issue)
+	// We'll focus on the most common "connection refused" pattern for simplicity in this test helper.
+	// A more robust check might inspect the underlying error type more deeply or use platform-specific checks.
+	// For this test, a simple string contains check is often sufficient to indicate the intended failure.
+	// However, relying on string matching is fragile. Let's stick to checking the OpError/SyscallError structure first.
+	// If the structured check fails, we can add specific string checks if necessary, but it's less ideal.
+	// Let's refine the structured check.
+	// The error from net.Dial on connection refused is typically *net.OpError with a *os.SyscallError inside.
+	// The SyscallError's Err field is a syscall.Errno or similar platform-specific error value.
+	// We need to check the *value* of this error, not just its string representation, if possible.
+	// However, accessing syscall.Errno values directly is platform-dependent.
+	// The string representation is often the most portable way to check for specific *types* of network errors
+	// when the underlying error value isn't easily accessible or comparable across platforms.
+	// Let's add a robust string check as a fallback, acknowledging its limitations.
+	// A better approach might be to use a library or a more comprehensive set of checks for network errors.
+	// For this test, let's keep it simple and check for the common string pattern.
+	// This is a compromise between robustness and simplicity for a test helper.
+	// If tests fail on a specific platform due to different error messages, this helper might need refinement.
+	unwrappedErr.Error() == "connection refused" ||
+		unwrappedErr.Error() == "connect: connection refused" ||
+		unwrappedErr.Error() == "dial tcp: connect: connection refused" || // Common format
+		unwrappedErr.Error() == "dial unix: connect: connection refused" || // Unix socket format
+		// Add other common patterns if needed based on test failures on different platforms
+		// e.g., strings.Contains(err.Error(), "connection refused")
+		false)
 }
 
 // setupServerClientQueues is a helper function to set up a server and client queue pair for testing.
@@ -279,7 +279,7 @@ func setupServerClientQueues(t *testing.T, network string) (*SocketTaskQueue, *S
 	}
 
 	// Start server
-	serverQ, err := NewSocketTaskQueue("server", network, addr)
+	serverQ, err := NewSocketTaskQueue("server", network, addr, nil) // Add nil for options
 	if err != nil {
 		if tmpDir != "" {
 			os.RemoveAll(tmpDir)
@@ -293,7 +293,7 @@ func setupServerClientQueues(t *testing.T, network string) (*SocketTaskQueue, *S
 	}
 
 	// Start client
-	clientQ, err := NewSocketTaskQueue("client", network, addr)
+	clientQ, err := NewSocketTaskQueue("client", network, addr, nil) // Add nil for options
 	if err != nil {
 		serverQ.Close()
 		if tmpDir != "" {
@@ -342,7 +342,6 @@ func setupServerClientQueues(t *testing.T, network string) (*SocketTaskQueue, *S
 
 	return serverQ, clientQ, addr, cleanup
 }
-
 
 func TestPushPopTask(t *testing.T) {
 	serverQ, clientQ, _, cleanup := setupServerClientQueues(t, "unix")
@@ -458,7 +457,6 @@ func TestClose(t *testing.T) {
 	}
 }
 
-
 // TODO: Add tests for:
 // - Error handling for invalid messages (e.g., wrong magic number, invalid JSON)
 // - Len() method (should always return 0 for this implementation) - Already implemented in TestLen
@@ -493,7 +491,6 @@ func TestPushPopOnClosedConnection(t *testing.T) {
 	_ = clientQ.Push(ctxPush, taskToPush)
 	// Give writerLoop a chance to fail
 	time.Sleep(50 * time.Millisecond)
-
 
 	// Verify Pop on closed connection returns error
 	ctxPop, cancelPop := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -531,7 +528,6 @@ func TestPushPopOnClosedConnection(t *testing.T) {
 		// but worth noting.
 	}
 }
-
 
 // TODO: Add tests for:
 // - Len() method (should always return 0 for this implementation) - Already implemented in TestLen
@@ -683,7 +679,6 @@ func TestInvalidJSONHandling(t *testing.T) {
 
 }
 
-
 // TestLen verifies the Len() method always returns 0
 func TestLen(t *testing.T) {
 	t.Parallel() // Mark test as parallelizable
@@ -733,13 +728,12 @@ func TestLen(t *testing.T) {
 	}
 }
 
-
 func TestConcurrentPushPop(t *testing.T) {
 	serverQ, clientQ, _, cleanup := setupServerClientQueues(t, "unix")
 	defer cleanup()
 
 	// Number of concurrent pushers and total tasks
-	numPushers := 10 // Number of goroutines pushing tasks
+	numPushers := 10   // Number of goroutines pushing tasks
 	totalTasks := 1000 // Total number of tasks to push
 
 	tasksPerPusher := totalTasks / numPushers
@@ -838,7 +832,6 @@ func TestConcurrentPushPop(t *testing.T) {
 	popWg.Wait()
 	t.Log("Pop goroutine finished.")
 
-
 	// Verify all tasks were received
 	if len(receivedTasks) != totalTasks {
 		t.Errorf("Expected to receive %d tasks, but received %d", totalTasks, len(receivedTasks))
@@ -852,7 +845,6 @@ func TestConcurrentPushPop(t *testing.T) {
 	// and compare against received tasks.
 }
 
-
 func TestClientReconnect(t *testing.T) {
 	// Use a temporary directory for the unix socket
 	tmpDir, err := os.MkdirTemp("", "client_reconnect_test")
@@ -863,14 +855,14 @@ func TestClientReconnect(t *testing.T) {
 	addr := fmt.Sprintf("%s/reconnect.sock", tmpDir)
 
 	// Start server
-	serverQ, err := NewSocketTaskQueue("server", "unix", addr)
+	serverQ, err := NewSocketTaskQueue("server", "unix", addr, nil) // Add nil for options
 	if err != nil {
 		t.Fatalf("Failed to create server queue: %v", err)
 	}
 	// Defer server close, but we will close and restart it manually in the test
 
 	// Start client
-	clientQ, err := NewSocketTaskQueue("client", "unix", addr)
+	clientQ, err := NewSocketTaskQueue("client", "unix", addr, nil) // Add nil for options
 	if err != nil {
 		serverQ.Close() // Clean up server if client creation fails
 		t.Fatalf("Failed to create client queue: %v", err)
@@ -908,16 +900,14 @@ func TestClientReconnect(t *testing.T) {
 	}
 	// slog.Info("Client connection is nil after server closure") // Removed slog in test
 
-
 	// Restart the server
 	// slog.Info("Restarting server") // Removed slog in test
-	serverQ_restarted, err := NewSocketTaskQueue("server", "unix", addr)
+	serverQ_restarted, err := NewSocketTaskQueue("server", "unix", addr, nil) // Add nil for options
 	if err != nil {
 		t.Fatalf("Failed to restart server: %v", err)
 	}
 	defer serverQ_restarted.Close()
 	// slog.Info("Server restarted") // Removed slog in test
-
 
 	// Wait for the client to reconnect and become stable enough to push
 	// We test stability by trying to push repeatedly.
@@ -966,7 +956,6 @@ func TestClientReconnect(t *testing.T) {
 	}
 	// slog.Info("Task pushed after reconnection") // Removed slog in test
 
-
 	// Increase Pop timeout to allow for network latency and processing
 	ctxPop, cancelPop := context.WithTimeout(context.Background(), 10*time.Second) // Increased timeout
 	defer cancelPop()
@@ -975,7 +964,6 @@ func TestClientReconnect(t *testing.T) {
 		t.Fatalf("Failed to pop task after reconnection: %v", err)
 	}
 	// slog.Info("Task popped after reconnection") // Removed slog in test
-
 
 	poppedDummyTask, ok := poppedTask.(*DummyTask)
 	if !ok {

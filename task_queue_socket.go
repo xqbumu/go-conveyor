@@ -22,6 +22,30 @@ var (
 	magicNumber           = []byte{0x1A, 0x2B, 0x3C, 0x4D} // Define as byte slice directly
 )
 
+// SocketQueueOptions holds configuration options for SocketTaskQueue.
+type SocketQueueOptions struct {
+	TaskChanBuffer        int           // Buffer size for the internal task channel
+	WriteChanBuffer       int           // Buffer size for the outgoing message channel
+	ReadChanBuffer        int           // Buffer size for the incoming message channel
+	ReconnectInitialDelay time.Duration // Initial delay before the first reconnect attempt
+	ReconnectMaxDelay     time.Duration // Maximum delay between reconnect attempts
+	ReconnectFactor       float64       // Multiplier for exponential backoff
+	ReconnectJitter       float64       // Jitter factor to randomize reconnect delays (0.0 to 1.0)
+}
+
+// DefaultSocketQueueOptions returns a new SocketQueueOptions with default values.
+func DefaultSocketQueueOptions() *SocketQueueOptions {
+	return &SocketQueueOptions{
+		TaskChanBuffer:        1000,
+		WriteChanBuffer:       1000,
+		ReadChanBuffer:        1000,
+		ReconnectInitialDelay: 1 * time.Second,
+		ReconnectMaxDelay:     60 * time.Second,
+		ReconnectFactor:       2.0,
+		ReconnectJitter:       0.1, // 10% jitter
+	}
+}
+
 // RegisterTaskType registers a task type with the socket task queue for deserialization.
 // The taskFactory function should return a new, empty instance of the task type.
 func RegisterTaskType(taskType string, taskFactory func() ITask) {
@@ -66,25 +90,47 @@ type SocketTaskQueue struct {
 	// Context for managing goroutine lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// Configuration options
+	opts *SocketQueueOptions
 }
 
-// NewSocketTaskQueue creates a new SocketTaskQueue.
+// NewSocketTaskQueue creates a new SocketTaskQueue with optional configurations.
 // mode should be "server" or "client".
 // network should be "tcp" or "unix".
 // addr is the address to listen on (server) or connect to (client).
-func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
+// If opts is nil, default options are used.
+func NewSocketTaskQueue(mode, network, addr string, opts *SocketQueueOptions) (*SocketTaskQueue, error) {
+	if opts == nil {
+		opts = DefaultSocketQueueOptions()
+	}
+	// Validate options (optional but recommended)
+	if opts.ReconnectJitter < 0 || opts.ReconnectJitter > 1 {
+		return nil, fmt.Errorf("invalid ReconnectJitter value: %f, must be between 0.0 and 1.0", opts.ReconnectJitter)
+	}
+	if opts.ReconnectFactor <= 1 {
+		return nil, fmt.Errorf("invalid ReconnectFactor value: %f, must be greater than 1.0", opts.ReconnectFactor)
+	}
+	if opts.ReconnectInitialDelay <= 0 || opts.ReconnectMaxDelay <= 0 || opts.ReconnectMaxDelay < opts.ReconnectInitialDelay {
+		return nil, fmt.Errorf("invalid reconnect delay values: Initial=%v, Max=%v", opts.ReconnectInitialDelay, opts.ReconnectMaxDelay)
+	}
+	if opts.TaskChanBuffer < 0 || opts.WriteChanBuffer < 0 || opts.ReadChanBuffer < 0 {
+		return nil, fmt.Errorf("channel buffer sizes cannot be negative: Task=%d, Write=%d, Read=%d", opts.TaskChanBuffer, opts.WriteChanBuffer, opts.ReadChanBuffer)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	q := &SocketTaskQueue{
 		addr:        addr,
 		network:     network,
 		mode:        mode,
-		activeConns: make(map[net.Conn]struct{}), // Initialize for server mode
-		taskChan:    make(chan ITask, 1000),      // Buffered channel for tasks
-		writeChan:   make(chan []byte, 1000),     // Buffered channel for messages to write
-		readChan:    make(chan []byte, 1000),     // Buffered channel for messages read
+		activeConns: make(map[net.Conn]struct{}),             // Initialize for server mode
+		taskChan:    make(chan ITask, opts.TaskChanBuffer),   // Use option
+		writeChan:   make(chan []byte, opts.WriteChanBuffer), // Use option
+		readChan:    make(chan []byte, opts.ReadChanBuffer),  // Use option
 		ctx:         ctx,
 		cancel:      cancel,
+		opts:        opts, // Store options
 	}
 
 	// Initialize condition variable for both modes
@@ -182,15 +228,21 @@ func (q *SocketTaskQueue) acceptConnections() {
 	}
 }
 
-// reconnectClient attempts to reconnect to the server (client mode) with exponential backoff.
+// reconnectClient attempts to reconnect to the server (client mode) with exponential backoff using configured options.
 func (q *SocketTaskQueue) reconnectClient() {
-	// Exponential backoff parameters
-	initialDelay := 1 * time.Second
-	maxDelay := 60 * time.Second
-	factor := 2.0
-	jitter := 0.1 // 10% jitter
+	// Use configured options
+	initialDelay := q.opts.ReconnectInitialDelay
+	maxDelay := q.opts.ReconnectMaxDelay
+	factor := q.opts.ReconnectFactor
+	jitter := q.opts.ReconnectJitter
 
 	currentDelay := initialDelay
+
+	slog.Info("Client reconnect parameters",
+		"initialDelay", initialDelay,
+		"maxDelay", maxDelay,
+		"factor", factor,
+		"jitter", jitter)
 
 	for {
 		q.mu.Lock()
