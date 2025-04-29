@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"os"
 	"sync"
@@ -31,6 +32,7 @@ type SocketTaskQueue struct {
 	network  string
 	mode     string // "server" or "client"
 	mu       sync.Mutex
+	cond     *sync.Cond // Condition variable to signal connection status changes
 	closed   bool
 }
 
@@ -74,16 +76,34 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 		}
 	case "client":
 		slog.Info("Client connecting to", "network", network, "addr", addr)
+		// Seed random for jitter in reconnection
+		rand.Seed(time.Now().UnixNano())
+
+		// Attempt initial connection
 		q.conn, err = net.Dial(network, addr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to connect to %s %s: %w", network, addr, err)
+			slog.Error("Initial client connection failed", "error", err)
+			// Start reconnect goroutine even if initial connection fails
+			go q.reconnectClient()
+			// Return error to the caller if initial connection fails
+			return nil, fmt.Errorf("initial client connection failed: %w", err)
+		} else {
+			slog.Info("Client connected successfully", "remote_addr", q.conn.RemoteAddr())
+			// Signal that a connection is available
+			q.cond.Broadcast()
 		}
-		slog.Info("Client connected", "remote_addr", q.conn.RemoteAddr())
-		// TODO: Implement client reconnection logic
+
+		// Always start client reconnection logic in a goroutine
+		go q.reconnectClient()
+
+		// Return the queue instance on successful initial connection
+		return q, nil
 	default:
 		return nil, fmt.Errorf("unsupported mode: %s, must be 'server' or 'client'", mode)
 	}
 
+	// Initialize condition variable for both modes
+	q.cond = sync.NewCond(&q.mu)
 	return q, nil
 }
 
@@ -112,15 +132,98 @@ func (q *SocketTaskQueue) acceptConnections() {
 	}
 }
 
-// Push adds a task to the queue by sending it over the socket.
-func (q *SocketTaskQueue) Push(task ITask) error {
-	q.mu.Lock()
-	conn := q.conn
-	q.mu.Unlock()
+// reconnectClient attempts to reconnect to the server (client mode) with exponential backoff.
+func (q *SocketTaskQueue) reconnectClient() {
+	// Exponential backoff parameters
+	initialDelay := 1 * time.Second
+	maxDelay := 60 * time.Second
+	factor := 2.0
+	jitter := 0.1 // 10% jitter
 
-	if conn == nil {
-		return errors.New("no active connection to push task")
+	currentDelay := initialDelay
+
+	for {
+		q.mu.Lock()
+		closed := q.closed
+		conn := q.conn
+		q.mu.Unlock()
+
+		if closed {
+			slog.Info("Client reconnection goroutine exiting: queue is closed")
+			return // Exit if the queue is closed
+		}
+
+		if conn != nil {
+			// Connection is active, wait a bit before checking again
+			// This sleep prevents a tight loop if the connection is active but unusable
+			time.Sleep(time.Second)
+			continue
+		}
+
+		slog.Info("Client attempting to reconnect", "network", q.network, "addr", q.addr, "delay", currentDelay)
+		newConn, err := net.Dial(q.network, q.addr)
+		if err != nil {
+			slog.Error("Client reconnection failed", "error", err)
+
+			// Calculate next delay with backoff and jitter
+			sleepDuration := currentDelay
+			// Add jitter: random value between -jitter*currentDelay and +jitter*currentDelay
+			sleepDuration += time.Duration((rand.Float64() - 0.5) * 2.0 * jitter * float64(currentDelay)) // Use Float64 for better distribution
+
+			// Ensure sleepDuration is not negative
+			if sleepDuration < 0 {
+				sleepDuration = 0
+			}
+
+			time.Sleep(sleepDuration)
+
+			// Increase delay, cap at maxDelay
+			currentDelay = time.Duration(float64(currentDelay) * factor)
+			if currentDelay > maxDelay {
+				currentDelay = maxDelay
+			}
+
+			continue // Retry connection
+		}
+
+		q.mu.Lock()
+		q.conn = newConn
+		q.mu.Unlock()
+		slog.Info("Client reconnected successfully", "remote_addr", newConn.RemoteAddr())
+
+		// Signal that a connection is available
+		q.cond.Broadcast()
+
+		// Reset delay on successful connection
+		currentDelay = initialDelay
 	}
+}
+
+// Push adds a task to the queue by sending it over the socket.
+// It waits for a connection to be available, respecting the context deadline.
+func (q *SocketTaskQueue) Push(ctx context.Context, task ITask) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	// Wait for a connection if none is available
+	for q.conn == nil && !q.closed {
+		slog.Debug("Push: Waiting for connection")
+		// Wait for signal or context cancellation
+		select {
+		case <-ctx.Done():
+			slog.Debug("Push: Context done while waiting for connection", "error", ctx.Err())
+			return fmt.Errorf("Push: context done while waiting for connection: %w", ctx.Err())
+		default:
+			// Wait on the condition variable. This releases the mutex and re-acquires it when signaled.
+			q.cond.Wait()
+		}
+	}
+
+	if q.closed {
+		return errors.New("Push: queue is closed")
+	}
+
+	conn := q.conn // Use the established connection
 
 	// Marshal the task data into json.RawMessage
 	taskDataBytes, err := json.Marshal(task)
@@ -154,15 +257,33 @@ func (q *SocketTaskQueue) Push(task ITask) error {
 }
 
 // Pop retrieves a task from the queue by reading from the socket.
+// It waits for a connection to be available and reads with the context deadline.
 func (q *SocketTaskQueue) Pop(ctx context.Context) (ITask, error) {
 	var zero ITask // Declare zero value for ITask
-	q.mu.Lock()
-	conn := q.conn
-	q.mu.Unlock()
 
-	if conn == nil {
-		return zero, errors.New("Pop: no active connection to pop task")
+	q.mu.Lock()
+	// Wait for a connection if none is available
+	for q.conn == nil && !q.closed {
+		slog.Debug("Pop: Waiting for connection")
+		// Wait for signal or context cancellation
+		select {
+		case <-ctx.Done():
+			slog.Debug("Pop: Context done while waiting for connection", "error", ctx.Err())
+			q.mu.Unlock()
+			return zero, fmt.Errorf("Pop: context done while waiting for connection: %w", ctx.Err())
+		default:
+			// Wait on the condition variable. This releases the mutex and re-acquires it when signaled.
+			q.cond.Wait()
+		}
 	}
+
+	if q.closed {
+		q.mu.Unlock()
+		return zero, errors.New("Pop: queue is closed")
+	}
+
+	conn := q.conn // Use the established connection
+	q.mu.Unlock() // Release mutex before reading
 
 	// Read the length-prefixed message
 	// Use a deadline from the context for the read operation
@@ -172,6 +293,7 @@ func (q *SocketTaskQueue) Pop(ctx context.Context) (ITask, error) {
 		conn.SetReadDeadline(deadline)
 	} else {
 		// Set a default short deadline if context has no deadline, to avoid blocking indefinitely
+		// This default deadline is important for the Pop method to be non-blocking if no task is available.
 		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	}
 
@@ -182,17 +304,22 @@ func (q *SocketTaskQueue) Pop(ctx context.Context) (ITask, error) {
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			// Timeout, no data available within the deadline
-			return zero, context.DeadlineExceeded // Or a custom "no task" error
+			return zero, context.DeadlineExceeded // Signal no task available within the deadline
 		}
 		if err == io.EOF {
 			slog.Info("Connection closed by remote peer during Pop read")
 			q.mu.Lock()
 			q.conn = nil // Clear the connection
+			q.cond.Broadcast() // Signal connection status change
 			q.mu.Unlock()
 			return zero, errors.New("Pop: connection closed by remote peer")
 		}
 		slog.Error("Failed to read message from connection during Pop", "error", err)
 		// Consider closing the connection on read errors if they are persistent
+		q.mu.Lock()
+		q.conn = nil // Clear the connection on read error
+		q.cond.Broadcast() // Signal connection status change
+		q.mu.Unlock()
 		return zero, fmt.Errorf("Pop: failed to read message from connection: %w", err)
 	}
 
@@ -249,6 +376,8 @@ func (q *SocketTaskQueue) Close() error {
 		return nil
 	}
 	q.closed = true
+	// Signal any waiting goroutines that the queue is closed
+	q.cond.Broadcast()
 
 	slog.Info("Closing socket task queue")
 
@@ -264,6 +393,7 @@ func (q *SocketTaskQueue) Close() error {
 		if err == nil { // Only set err if listener close didn't already set it
 			err = connErr
 		}
+		q.conn = nil // Clear the connection on close
 	}
 
 	return err
