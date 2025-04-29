@@ -39,8 +39,6 @@ type SocketTaskQueue struct {
 
 	// Channels for buffering tasks
 	// In server mode, this is the channel for tasks received from ALL clients.
-	readChanOnce sync.Once // Ensures readChan is closed only once
-	taskChanOnce sync.Once // Ensures taskChan is closed only once
 	// In client mode, this is the channel for tasks to be sent to the server.
 	taskChan chan ITask
 
@@ -148,13 +146,6 @@ func NewSocketTaskQueue(mode, network, addr string) (*SocketTaskQueue, error) {
 	default:
 		return nil, fmt.Errorf("unsupported mode: %s, must be 'server' or 'client'", mode)
 	}
-
-	// Start the goroutine to process received messages and put them into taskChan for server mode as well
-	if mode == "server" {
-		q.wg.Add(1)
-		go q.messageProcessor()
-	}
-
 
 	return q, nil
 }
@@ -392,9 +383,6 @@ func (q *SocketTaskQueue) Close() error {
 	}
 	q.mu.Unlock() // Unlock before closing handles
 
-	// Cancel the context first to signal goroutines
-	q.cancel()
-
 	// Close the listener (if server mode)
 	var listenerErr error
 	if listenerToClose != nil {
@@ -457,16 +445,10 @@ func (q *SocketTaskQueue) Close() error {
 
 	// Close the channels to signal goroutines that read from them
 	close(q.writeChan)
-	// Use sync.Once to ensure readChan is closed only once
-	q.readChanOnce.Do(func() {
-		close(q.readChan)
-		slog.Debug("readChan closed by Close")
-	})
-	// Use sync.Once to ensure taskChan is closed only once
-	q.taskChanOnce.Do(func() {
-		close(q.taskChan)
-		slog.Debug("taskChan closed by Close")
-	})
+	close(q.readChan)
+	slog.Debug("readChan closed by Close")
+	close(q.taskChan)
+	slog.Debug("taskChan closed by Close")
 
 	// Wait for all goroutines to finish
 	q.wg.Wait()
