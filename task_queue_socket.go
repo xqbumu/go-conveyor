@@ -170,8 +170,7 @@ func NewSocketTaskQueue(mode, network, addr string, opts *SocketQueueOptions) (*
 
 	case "client":
 		slog.Info("Client connecting to", "network", network, "addr", addr)
-		// Seed random for jitter in reconnection
-		rand.Seed(time.Now().UnixNano())
+		// Seed random for jitter in reconnection - No longer needed since Go 1.20
 
 		// Attempt initial connection
 		conn, err := net.Dial(network, addr)

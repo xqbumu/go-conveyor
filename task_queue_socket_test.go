@@ -935,7 +935,7 @@ func TestClientReconnect(t *testing.T) {
 
 		if pushErr == nil {
 			t.Log("Client connection stable enough to push.")
-			stable = true
+			// stable = true // Ineffectual assignment: loop breaks immediately after
 			// Pop the ping task from the server to clear it
 			pingPopCtx, pingPopCancel := context.WithTimeout(reconnectCtx, 500*time.Millisecond)
 			_, popErr := serverQ_restarted.Pop(pingPopCtx)

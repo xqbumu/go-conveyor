@@ -26,11 +26,11 @@
 * **Task Scheduling**: The `ConsumerPoolManager` distributes tasks to different channels based on priority, managing goroutine pools for concurrent execution.
 * **Task Execution**: Consumer goroutines read tasks from priority channels and execute them by calling the `Consume` method of the corresponding worker.
 * **Task Deduplication**: The `TaskSetManager` automatically prevents duplicate task execution by tracking tasks that are currently queued or being processed.
-* **Task Retry**: Supports configurable retrying of tasks after execution failures, including handling panics based on configuration (`RetryOnPanic`).
+* **Task Retry**: If a task fails execution, it will be automatically re-enqueued for another attempt, up to a configurable maximum number of retries (`WithMaxRetries`). Panic handling during retries is also configurable (`WithRetryOnPanic`). This non-blocking retry mechanism improves consumer throughput.
 * **Task Timeout**: Provides control over individual task execution timeouts.
 * **Graceful Shutdown**: The `Manager` supports graceful stopping, ensuring all components and running tasks are properly shut down.
 * **Metrics**: Provides basic metrics on tasks queued, processed, failed, and active workers.
-* **Configuration**: Allows customization of consumer pool sizes, producer intervals, task timeouts, and retry behavior via `ManagerConfig` and options.
+* **Configuration**: Allows customization of consumer pool sizes, producer intervals, task timeouts, maximum retries, and retry behavior via `ManagerConfig` and options (e.g., `WithMaxRetries`, `WithRetryOnPanic`).
 
 ## Installation
 
