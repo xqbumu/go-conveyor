@@ -6,6 +6,8 @@ import (
 	"log/slog"
 )
 
+var _ TaskQueue = (*TaskQueueChannel)(nil)
+
 // TaskQueueChannel implements the TaskQueue interface using a Go channel.
 type TaskQueueChannel struct {
 	tasks chan ITask
@@ -19,7 +21,7 @@ func NewChannelTaskQueue(bufferSize int) *TaskQueueChannel {
 }
 
 // Push adds a task to the channel.
-func (q *TaskQueueChannel) Push(task ITask) error {
+func (q *TaskQueueChannel) Push(ctx context.Context, task ITask) error {
 	select {
 	case q.tasks <- task:
 		slog.Debug("Task pushed to channel", "identifier", task.GetIdentify())

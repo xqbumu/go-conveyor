@@ -100,7 +100,7 @@ func (e PanicError) Error() string {
 // TaskQueue defines the interface for task storage and retrieval mechanisms.
 type TaskQueue interface {
 	// Push adds a task to the queue.
-	Push(task ITask) error
+	Push(ctx context.Context, task ITask) error
 	// Pop retrieves a task from the queue, blocking until a task is available or the context is done.
 	Pop(ctx context.Context) (ITask, error)
 	// Len returns the current number of tasks in the queue.

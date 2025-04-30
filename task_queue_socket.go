@@ -22,6 +22,8 @@ var (
 	magicNumber           = []byte{0x1A, 0x2B, 0x3C, 0x4D} // Define as byte slice directly
 )
 
+var _ TaskQueue = (*SocketTaskQueue)(nil)
+
 // SocketQueueOptions holds configuration options for SocketTaskQueue.
 type SocketQueueOptions struct {
 	TaskChanBuffer        int           // Buffer size for the internal task channel

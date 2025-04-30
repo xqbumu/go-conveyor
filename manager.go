@@ -312,7 +312,7 @@ func (m *Manager) AddTask(ctx context.Context, task ITask) error {
 	}
 
 	// 4. Try to push the task to the queue
-	sendErr := taskQueue.Push(task)
+	sendErr := taskQueue.Push(ctx, task)
 	taskSent := sendErr == nil // Task is sent if Push returns no error
 
 	if sendErr == nil {
