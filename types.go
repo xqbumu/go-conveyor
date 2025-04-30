@@ -33,6 +33,8 @@ type ITask interface {
 	GetType() any
 	GetPriority() int
 	GetTimeout() time.Duration
+	GetRetryCount() int
+	IncrementRetryCount() // Keep the interface method name
 }
 
 type TaskData[T any] interface {
@@ -41,20 +43,22 @@ type TaskData[T any] interface {
 
 // Task defines a task, containing all the information needed to execute the task.
 type Task[T any] struct {
-	ID       string        // Unique ID of the task, used for deduplication and tracking.
-	Typ      any           // Type of the task, used to distribute to the corresponding Worker.
-	Priority int           // Task priority (0: normal, >0: high priority, high priority tasks will try to be processed faster).
-	Timeout  time.Duration // Task execution timeout (0 means no timeout).
-	Data     T             // Data carried by the task, the specific type is determined by the task type.
+	ID         string        // Unique ID of the task, used for deduplication and tracking.
+	Typ        any           // Type of the task, used to distribute to the corresponding Worker.
+	Priority   int           // Task priority (0: normal, >0: high priority, high priority tasks will try to be processed faster).
+	Timeout    time.Duration // Task execution timeout (0 means no timeout).
+	Data       T             // Data carried by the task, the specific type is determined by the task type.
+	RetryCount int           // Number of times the task has been retried.
 }
 
-func NewTask[T any](id string, typ any, priority int, timeout time.Duration, data T) Task[T] {
-	return Task[T]{
-		ID:       id,
-		Typ:      typ,
-		Priority: priority,
-		Timeout:  timeout,
-		Data:     data,
+func NewTask[T any](id string, typ any, priority int, timeout time.Duration, data T) *Task[T] {
+	return &Task[T]{
+		ID:         id,
+		Typ:        typ,
+		Priority:   priority,
+		Timeout:    timeout,
+		Data:       data,
+		RetryCount: 0, // Initialize retry count to 0
 	}
 }
 
@@ -86,6 +90,17 @@ func (t Task[T]) GetTimeout() time.Duration {
 // Data returns the data associated with the task.
 func (t Task[T]) GetData() T {
 	return t.Data
+}
+
+// GetRetryCount returns the current retry count of the task.
+func (t Task[T]) GetRetryCount() int {
+	return t.RetryCount
+}
+
+// IncrementRetryCount increases the retry count of the task in place.
+func (t *Task[T]) IncrementRetryCount() {
+	// Use pointer receiver to modify the original task
+	t.RetryCount++
 }
 
 // PanicError wraps a panic value to be returned as an error.

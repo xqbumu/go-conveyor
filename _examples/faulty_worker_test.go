@@ -115,9 +115,7 @@ func ExampleNewManager_faulty() {
 	manager.AddTask(context.TODO(), conveyor.NewTask("success-task", "faulty_task", 0, 0, "This task will succeed"))
 	manager.AddTask(context.TODO(), conveyor.NewTask("unknown-task", "faulty_task", 0, 0, "This task has unknown ID")) // Test unknown task ID
 
-	// Wait for all tasks to complete
-	// Allow enough time for panic recovery and retries to occur
-	time.Sleep(5 * time.Second) // Extend the wait time appropriately
+	time.Sleep(1 * time.Second) // Extend the wait time appropriately
 
 	// Stop TaskManager
 	cancel()

@@ -40,6 +40,7 @@ func NewGenericManager(ctx context.Context, opts ...Option) (*Manager, error) {
 		ProducerCronSchedule: "",          // Default empty cron schedule (no cron trigger)
 		ProduceTimeout:       time.Minute, // Default producer Produce method timeout
 		RetryOnPanic:         false,       // Default to not retry on panic
+		MaxRetries:           3,           // Default max retries to 3
 	}
 
 	// Apply the passed-in configuration options to the config struct
@@ -91,8 +92,9 @@ func NewGenericManager(ctx context.Context, opts ...Option) (*Manager, error) {
 		"maxPriorityChannels", m.config.MaxPriorityChannels,
 		"maxTotalConsumers", m.config.MaxTotalConsumers,
 		"producerCronSchedule", m.config.ProducerCronSchedule,
-		"produceTimeout", m.config.ProduceTimeout, // Add Produce timeout to the log
-		"retryOnPanic", m.config.RetryOnPanic)
+		"produceTimeout", m.config.ProduceTimeout,
+		"retryOnPanic", m.config.RetryOnPanic,
+		"maxRetries", m.config.MaxRetries) // Log MaxRetries
 	return m, nil
 }
 
@@ -169,194 +171,211 @@ func (m *Manager) Stop() {
 	slog.Info("TaskManager stopped gracefully")
 }
 
-// processTaskWithRetry encapsulates the task processing and retry logic
-// This function is now a method of Manager and is passed as processTaskFunc to ConsumerPoolManager
+// processTaskWithRetry encapsulates the task processing logic.
+// If processing fails, it attempts to re-enqueue the task up to MaxRetries times.
+// This function is passed as processTaskFunc to ConsumerPoolManager.
 func (m *Manager) processTaskWithRetry(ctx context.Context, task ITask) {
-	maxRetries := 3                      // Maximum number of retries
 	taskIdentifier := task.GetIdentify() // Get task identifier for logging and metrics update
 
 	// Look up the corresponding Worker based on the task type
 	m.mu.RLock() // Read lock needed for reading workerMap
-	worker, ok := m.workerMap[task.GetType()]
+	worker, workerFound := m.workerMap[task.GetType()]
 	m.mu.RUnlock()
 
-	if !ok {
-		// If no corresponding Worker is found, log an error and mark the task as failed
-		slog.Error("No worker found for task type", "type", task.GetType(), "taskID", task.GetID())
+	// Decrement queued count as we are starting to process this task.
+	// If it gets re-enqueued, AddTask will increment it again.
+	atomic.AddInt64(&m.metrics.TasksQueued, -1)
+
+	if !workerFound {
+		// If no corresponding Worker is found, log an error and mark the task as finally failed
+		slog.Error("No worker found for task type, marking as failed", "type", task.GetType(), "taskID", task.GetID())
 		atomic.AddInt64(&m.metrics.TasksFailed, 1)
-		// Remove the task identifier from taskSetManager to indicate processing is complete (failed)
-		m.taskSetManager.Remove(taskIdentifier)
-		atomic.AddInt64(&m.metrics.TasksQueued, -1) // Task processing ended, decrease queued count
-		return                                      // Process the next task
+		m.taskSetManager.Remove(taskIdentifier) // Remove from set as it's a final state
+		return                                  // Task processing failed permanently
 	}
 
-	// Create a context for the current task to support timeout and cancellation
-	// The task context inherits from the context passed in by ConsumerPoolManager
-	taskCtx := ctx
+	// Create a context for this specific task execution attempt to support timeout
+	// Use the context passed from ConsumerPoolManager, but potentially add a task-specific timeout.
+	taskCtx := ctx // Start with the base context
 	var cancel context.CancelFunc
 	if task.GetTimeout() > 0 {
-		// If the task has a timeout set, create a context with timeout.
 		taskCtx, cancel = context.WithTimeout(ctx, task.GetTimeout())
-	} else {
-		// If the task has no timeout, create a cancellable context.
-		taskCtx, cancel = context.WithCancel(ctx)
+		defer cancel() // Ensure cancellation happens if timeout is used
 	}
-	defer func() {
-		if cancel != nil {
-			cancel()
-		}
-	}()
+	// No need for WithCancel if no timeout, as the base ctx handles overall cancellation.
 
-	// Execute the task processing with retry logic
-	for i := range maxRetries {
-		slog.Debug("Attempting task execution", "identifier", taskIdentifier, "attempt", i+1, "maxRetries", maxRetries)
+	slog.Debug("Attempting task execution", "identifier", taskIdentifier, "retryCount", task.GetRetryCount())
+	err := m.executeTaskConsume(taskCtx, worker, task) // Execute the task
 
-		err := m.executeTaskConsume(taskCtx, worker, task) // Use the helper function to execute
+	if err == nil {
+		// Task succeeded
+		atomic.AddInt64(&m.metrics.TasksProcessed, 1)
+		slog.Debug("Task processed successfully", "identifier", taskIdentifier, "retryCount", task.GetRetryCount())
+		m.taskSetManager.Remove(taskIdentifier) // Remove from set as it's a final state
+		return                                  // Success, exit the function
+	}
 
-		if err == nil {
-			// Task succeeded
-			atomic.AddInt64(&m.metrics.TasksProcessed, 1)
-			slog.Debug("Task processed successfully", "identifier", taskIdentifier, "attempt", i+1)
-			m.taskSetManager.Remove(taskIdentifier)
-			atomic.AddInt64(&m.metrics.TasksQueued, -1)
-			return // Success, exit the function
-		}
+	// Task failed (error or panic)
+	slog.Error("Task execution failed",
+		"taskID", task.GetID(),
+		"type", task.GetType(),
+		"retryCount", task.GetRetryCount(),
+		"error", err)
 
-		// Task failed (error or panic)
-		slog.Error("Task execution failed",
+	// Check if it's a panic and retry is disabled for panics
+	if _, isPanic := err.(PanicError); isPanic && !m.config.RetryOnPanic {
+		slog.Error("Task panicked and retryOnPanic is false, marking as failed",
 			"taskID", task.GetID(),
 			"type", task.GetType(),
-			"error", err,
-			"retryAttempt", i+1)
+			"panicError", err)
+		atomic.AddInt64(&m.metrics.TasksFailed, 1)
+		m.taskSetManager.Remove(taskIdentifier) // Remove from set as it's a final state
+		return                                  // Do not retry
+	}
 
-		// Check if it is a panic and retryOnPanic is false
-		if _, isPanic := err.(PanicError); isPanic && !m.config.RetryOnPanic {
-			slog.Error("Task panicked and retryOnPanic is false, marking as failed",
-				"taskID", task.GetID(),
-				"type", task.GetType(),
-				"panicError", err) // Log the wrapped panic error
-			atomic.AddInt64(&m.metrics.TasksFailed, 1)
-			m.taskSetManager.Remove(taskIdentifier)
-			atomic.AddInt64(&m.metrics.TasksQueued, -1)
-			return // If configured not to retry on panic, do not retry
-		}
+	// Check if the maximum number of retries has been reached
+	if task.GetRetryCount() >= m.config.MaxRetries {
+		slog.Error("Task failed after reaching max retries",
+			"identifier", taskIdentifier,
+			"retryCount", task.GetRetryCount(),
+			"maxRetries", m.config.MaxRetries)
+		atomic.AddInt64(&m.metrics.TasksFailed, 1)
+		m.taskSetManager.Remove(taskIdentifier) // Remove from set as it's a final state
+		return                                  // Failed permanently
+	}
 
-		// Check if the maximum number of retries has been reached
-		if i == maxRetries-1 {
-			atomic.AddInt64(&m.metrics.TasksFailed, 1)
-			slog.Error("Task failed after max retries", "identifier", taskIdentifier, "maxRetries", maxRetries)
-			m.taskSetManager.Remove(taskIdentifier)
-			atomic.AddInt64(&m.metrics.TasksQueued, -1)
-			return // Failed after retries, exit the function
-		}
-
-		// Check if the task context has been cancelled before retrying
-		select {
-		case <-taskCtx.Done():
-			slog.Warn("Task canceled or timed out during retry wait",
-				"taskID", task.GetID(),
-				"type", task.GetType(),
-				"error", taskCtx.Err())
-			atomic.AddInt64(&m.metrics.TasksFailed, 1)
-			m.taskSetManager.Remove(taskIdentifier)
-			atomic.AddInt64(&m.metrics.TasksQueued, -1)
-			return // Context cancelled, exit the function
-		default:
-			// Continue retrying
-		}
-
-		// Wait before retrying (exponential backoff), allowing cancellation
-		retryDelay := time.Second * time.Duration(i+1)
-		slog.Info("Retrying task", "taskID", task.GetID(), "type", task.GetType(), "delay", retryDelay)
-
-		timer := time.NewTimer(retryDelay)
-		select {
-		case <-timer.C:
-			// Timer expired, continue with the next retry attempt
-		case <-taskCtx.Done():
-			slog.Warn("Task context cancelled during retry delay",
-				"taskID", task.GetID(),
-				"type", task.GetType(),
-				"error", taskCtx.Err())
-			// Attempt to stop the timer and drain if necessary
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			atomic.AddInt64(&m.metrics.TasksFailed, 1) // Mark as failed due to cancellation during wait
-			m.taskSetManager.Remove(taskIdentifier)
-			atomic.AddInt64(&m.metrics.TasksQueued, -1)
-			return // Context cancelled, exit the function
-		}
+	// Check if the base context (from ConsumerPoolManager) is done before attempting re-enqueue
+	select {
+	case <-ctx.Done():
+		slog.Warn("Base context cancelled before task re-enqueue attempt, marking as failed",
+			"taskID", task.GetID(),
+			"type", task.GetType(),
+			"error", ctx.Err())
+		atomic.AddInt64(&m.metrics.TasksFailed, 1)
+		m.taskSetManager.Remove(taskIdentifier) // Remove from set as it's a final state
+		return                                  // Context cancelled
+	default:
+		// Context is not done, proceed with re-enqueue
+		m.reEnqueueTask(ctx, task) // Attempt to re-enqueue the task
 	}
 }
 
-// AddTask adds a new task to the task manager
+// reEnqueueTask increments the task's retry count and attempts to add it back to the queue.
+// If re-enqueueing fails, it marks the task as failed.
+func (m *Manager) reEnqueueTask(ctx context.Context, task ITask) {
+	taskIdentifier := task.GetIdentify()
+	task.IncrementRetryCount() // Increment in place
+
+	slog.Info("Re-enqueueing task for retry",
+		"identifier", taskIdentifier,
+		"newRetryCount", task.GetRetryCount(),
+		"maxRetries", m.config.MaxRetries)
+
+	// Use a background context for re-enqueueing to avoid being cancelled by the original task's timeout context.
+	// However, respect the overall manager context passed in originally.
+	// If the manager is stopping (ctx.Done()), AddTask should ideally handle this.
+	// Let's pass the original ctx from processTaskWithRetry (which comes from ConsumerPoolManager).
+	// AddTask uses this context for queue operations (like waiting if the queue is full).
+	err := m.AddTask(ctx, task) // Re-add the task with incremented retry count
+
+	if err != nil {
+		// If re-enqueueing fails (e.g., queue closed, context cancelled during push), mark as failed.
+		// AddTask should have already removed it from the taskSetManager in case of failure.
+		// The TasksQueued count was decremented when processing started, and AddTask failed to increment it.
+		slog.Error("Failed to re-enqueue task, marking as failed",
+			"identifier", taskIdentifier,
+			"retryCount", task.GetRetryCount(),
+			"error", err)
+		atomic.AddInt64(&m.metrics.TasksFailed, 1)
+		// No need to remove from set or adjust queue count here, AddTask handles it on failure.
+	}
+	// If AddTask succeeds, it increments TasksQueued, balancing the decrement at the start of processTaskWithRetry.
+	// The task remains in the taskSetManager.
+}
+
+// AddTask adds a new task to the task manager.
+// It handles task deduplication via TaskSetManager and pushes the task to the appropriate queue.
 // Parameters:
-//   - ctx: Context to control the timeout or cancellation of the addition operation (mainly affects high-priority task addition and normal task blocking wait)
-//   - id: Unique ID of the task
-//   - taskType: Type of the task
-//   - data: Data to be processed by the task
-//   - priority: Task priority (0: normal, >0: high priority)
-//   - timeout: Task execution timeout (0 means no timeout)
+//   - ctx: Context to control the timeout or cancellation of the queue push operation.
+//   - task: The task to add (must implement ITask).
 //
 // Returns:
-//   - error: Returns an error if the task already exists, adding a high-priority task times out, or the context is cancelled
+//   - error: Returns an error if the task already exists (and wasn't a retry),
+//     if getting/creating the queue fails, if pushing to the queue fails,
+//     or if the context is cancelled during the operation.
 func (m *Manager) AddTask(ctx context.Context, task ITask) error {
 	taskIdentifier := task.GetIdentify()
+	isRetry := task.GetRetryCount() > 0 // Check if this is a retry attempt
 
-	// 1. Check if the task already exists and try to add it to the taskSetManager
-	// Use TaskSetManager to check if the task exists and add it
-	added, err := m.taskSetManager.Add(taskIdentifier)
-	if err != nil {
-		slog.Error("Failed to add task to task set manager", "identifier", taskIdentifier, "error", err)
-		return fmt.Errorf("failed to add task to task set manager: %s", taskIdentifier)
+	// 1. Handle TaskSetManager interaction
+	// If it's a retry, the task should already be in the set.
+	// If it's a new task, try to add it to the set.
+	if !isRetry {
+		added, err := m.taskSetManager.Add(taskIdentifier)
+		if err != nil {
+			slog.Error("Failed to add new task to task set manager", "identifier", taskIdentifier, "error", err)
+			return fmt.Errorf("failed to add task to task set manager: %s: %w", taskIdentifier, err)
+		}
+		if !added {
+			slog.Warn("New task already exists in set, skipping addition", "identifier", taskIdentifier)
+			return fmt.Errorf("task already exists: %s", taskIdentifier)
+		}
+		// New task successfully added to the set.
+	} else {
+		// For retries, we assume the task is already in the set.
+		// We don't need to call Add again. If it wasn't in the set, something went wrong earlier.
+		slog.Debug("Task is a retry, skipping TaskSetManager.Add", "identifier", taskIdentifier, "retryCount", task.GetRetryCount())
 	}
-	if !added {
-		slog.Warn("Task already exists, skipping addition", "identifier", taskIdentifier)
-		return fmt.Errorf("task already exists: %s", taskIdentifier)
-	}
-	// Task successfully added to the set, but don't increment queue count yet.
 
-	slog.Debug("Attempting to add task to queue", "identifier", taskIdentifier, "priority", task.GetPriority())
-
-	// 2. Get or create the corresponding queue through ConsumerPoolManager
-	// ConsumerPoolManager will be responsible for creating the queue and starting consumers
+	// 2. Get or create the corresponding queue via ConsumerPoolManager
 	taskQueue, err := m.consumerPoolManager.GetOrCreateQueue(task.GetPriority(), taskIdentifier, m.processTaskWithRetry)
 	if err != nil {
-		// GetOrCreateQueue failed, rollback state
-		m.rollbackAddTask(taskIdentifier)
 		slog.Error("Failed to get or create task queue", "identifier", taskIdentifier, "priority", task.GetPriority(), "error", err)
-		return err
+		// If getting the queue failed, and it was a *new* task we added to the set, remove it.
+		if !isRetry {
+			m.taskSetManager.Remove(taskIdentifier)
+			slog.Warn("Removed new task from set after failing to get queue", "identifier", taskIdentifier)
+		}
+		// For retries, leave it in the set - maybe the queue will be available next time? Or should we fail it?
+		// Let's fail it permanently if queue acquisition fails during retry.
+		if isRetry {
+			slog.Error("Failed to get queue during retry, marking task as failed", "identifier", taskIdentifier)
+			atomic.AddInt64(&m.metrics.TasksFailed, 1) // Mark as failed
+			m.taskSetManager.Remove(taskIdentifier)    // Remove from set
+			// No change needed to TasksQueued as it was already decremented by the processing attempt.
+		}
+		return fmt.Errorf("failed to get or create queue for task %s: %w", taskIdentifier, err)
 	}
 
 	// 3. Try to push the task to the queue
-	sendErr := taskQueue.Push(ctx, task)
-	taskSent := sendErr == nil // Task is sent if Push returns no error
+	slog.Debug("Attempting to push task to queue", "identifier", taskIdentifier, "priority", task.GetPriority(), "retryCount", task.GetRetryCount())
+	pushErr := taskQueue.Push(ctx, task)
 
-	if sendErr == nil {
+	if pushErr == nil {
 		// Increment queue count only on successful push
 		atomic.AddInt64(&m.metrics.TasksQueued, 1)
-		slog.Info("Task added successfully", "identifier", taskIdentifier, "priority", task.GetPriority())
-	} else {
-		slog.Error("Failed to push task to queue", "identifier", taskIdentifier, "priority", task.GetPriority(), "error", sendErr)
+		logMsg := "New task added successfully"
+		if isRetry {
+			logMsg = "Task re-enqueued successfully"
+		}
+		slog.Info(logMsg, "identifier", taskIdentifier, "priority", task.GetPriority(), "retryCount", task.GetRetryCount())
+		return nil // Success
 	}
 
-	// If the task was not successfully sent, perform a rollback (remove from set)
-	// Note: rollbackAddTask decrements the queue count, which we haven't incremented yet if push failed.
-	// We should adjust rollbackAddTask or handle the count here.
-	// Let's modify the logic here: only remove from set, don't decrement count yet.
-	if !taskSent {
-		// We added it to the set, but failed to push. Remove from set.
-		m.taskSetManager.Remove(taskIdentifier)
-		// Do not call rollbackAddTask as it decrements a count we haven't incremented.
-		slog.Warn("Task push failed, removed from task set", "identifier", taskIdentifier)
-	}
+	// Push failed
+	slog.Error("Failed to push task to queue", "identifier", taskIdentifier, "priority", task.GetPriority(), "retryCount", task.GetRetryCount(), "error", pushErr)
+	// If push failed, remove the task from the set (whether it was new or a retry)
+	m.taskSetManager.Remove(taskIdentifier)
+	slog.Warn("Removed task from set after failing to push to queue", "identifier", taskIdentifier)
 
-	// 4. Return the send result
-	return sendErr
+	// If it was a retry attempt that failed to push, mark it as finally failed.
+	if isRetry {
+		atomic.AddInt64(&m.metrics.TasksFailed, 1)
+		// TasksQueued was already decremented by the processing attempt, and push failed, so count is correct.
+	}
+	// For new tasks, failing to push means it never really entered the system processing flow.
+
+	return fmt.Errorf("failed to push task %s to queue: %w", taskIdentifier, pushErr)
 }
 
 // GetMetrics returns a snapshot of the current metrics of the task manager

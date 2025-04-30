@@ -14,8 +14,9 @@ import (
 
 // DummyTask is a simple task implementation for testing.
 type DummyTask struct {
-	ID   string `json:"id"`
-	Data string `json:"data"`
+	ID         string `json:"id"`
+	Data       string `json:"data"`
+	RetryCount int    `json:"retry_count"` // Add RetryCount field
 }
 
 func (t *DummyTask) GetIdentify() string {
@@ -36,6 +37,16 @@ func (t *DummyTask) GetPriority() int {
 
 func (t *DummyTask) GetTimeout() time.Duration {
 	return 0 // Default timeout for testing
+}
+
+// GetRetryCount implements ITask.
+func (t *DummyTask) GetRetryCount() int {
+	return t.RetryCount
+}
+
+// IncrementRetryCount implements ITask.
+func (t *DummyTask) IncrementRetryCount() {
+	t.RetryCount++
 }
 
 // Ensure DummyTask implements ITask

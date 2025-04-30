@@ -28,6 +28,7 @@ type ManagerConfig struct {
 	ProducerCronSchedule string           // Cron schedule string for the producer to trigger the Produce method
 	ProduceTimeout       time.Duration    // Timeout for the producer's Produce method (0 means no timeout)
 	RetryOnPanic         bool             // Whether to retry tasks when a Worker panics
+	MaxRetries           int              // Maximum number of times a task should be retried after failure (0 means no retries)
 	TaskQueueFactory     TaskQueueFactory // Factory function to create TaskQueue instances
 }
 
@@ -101,5 +102,15 @@ func WithProducerCronSchedule(schedule string) Option {
 func WithProduceTimeout(timeout time.Duration) Option {
 	return func(cfg *ManagerConfig) {
 		cfg.ProduceTimeout = timeout
+	}
+}
+
+// WithMaxRetries configures the maximum number of times a task should be retried.
+func WithMaxRetries(max int) Option {
+	return func(cfg *ManagerConfig) {
+		if max < 0 {
+			max = 0 // Ensure max retries is not negative
+		}
+		cfg.MaxRetries = max
 	}
 }

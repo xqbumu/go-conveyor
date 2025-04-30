@@ -33,7 +33,7 @@ func (w *FullWorker) Produce(ctx context.Context) error {
 
 // Consume implements the Consume method of the Worker interface.
 func (w *FullWorker) Consume(ctx context.Context, task conveyor.ITask) error {
-	t, ok := task.(conveyor.Task[string])
+	t, ok := task.(*conveyor.Task[string])
 	if !ok {
 		return fmt.Errorf("task is not of type *conveyor.Task")
 	}
