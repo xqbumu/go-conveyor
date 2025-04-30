@@ -1,5 +1,47 @@
 # Changelog
 
+## [v0.0.5] - 2025-04-30
+
+### Fixes
+
+- Fixed `ineffassign` linting error in `task_queue_socket_test.go`.
+- Removed deprecated `rand.Seed` call in `task_queue_socket.go` (SA1019).
+
+### Refactor
+
+- Remove unused rollbackAddTask helper function from Manager.
+- Introduce retry mechanism for task processing with configurable max retries.
+- Enhance cancellation handling in ConsumerPoolManager and TaskQueue methods.
+- Update Push method to accept context and enhance TaskQueue interface.
+- Introduce SocketQueueOptions for configurable SocketTaskQueue and update related methods.
+- Define magic number as a byte slice and simplify its usage in message handling.
+- Simplify error handling and improve message reading/writing in SocketTaskQueue.
+
+### Test
+
+- Add TestInvalidJSONHandling to verify server behavior with invalid TaskData JSON.
+
+### 修复
+
+- 修复了 `task_queue_socket_test.go` 中的 `ineffassign` linting 错误。
+- 移除了 `task_queue_socket.go` 中已弃用的 `rand.Seed` 调用 (SA1019)。
+
+### 重构
+
+- 从 Manager 中移除未使用的 rollbackAddTask 辅助函数。
+- 引入任务处理重试机制，支持可配置的最大重试次数。
+- 增强 ConsumerPoolManager 和 TaskQueue 方法中的取消处理。
+- 更新 Push 方法以接受 context 并增强 TaskQueue 接口。
+- 引入 SocketQueueOptions 以支持可配置的 SocketTaskQueue 并更新相关方法。
+- 将魔术数字定义为字节切片并简化其在消息处理中的使用。
+- 简化 SocketTaskQueue 中的错误处理并改进消息读写。
+
+### 测试
+
+- 添加 TestInvalidJSONHandling 以验证服务器在处理无效 TaskData JSON 时的行为。
+
+
+
 ## [v0.0.4] - 2025-04-29
 
 ### Features
