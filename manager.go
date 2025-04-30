@@ -119,13 +119,6 @@ func (m *Manager) Start() {
 	slog.Info("TaskManager stopped gracefully")
 }
 
-// rollbackAddTask is a helper function to clean up state before a task fails to send to the channel.
-func (m *Manager) rollbackAddTask(taskIdentifier string) {
-	atomic.AddInt64(&m.metrics.TasksQueued, -1) // Rollback queued count
-	m.taskSetManager.Remove(taskIdentifier)     // Remove from taskSetManager
-	slog.Warn("Task addition failed or was cancelled before sending, rolled back state", "identifier", taskIdentifier)
-}
-
 // executeTaskConsume is a helper function to execute worker.Consume and recover from panic.
 func (m *Manager) executeTaskConsume(taskCtx context.Context, worker Worker, task ITask) (err error) {
 	defer func() {
