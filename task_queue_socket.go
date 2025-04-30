@@ -189,6 +189,8 @@ func NewSocketTaskQueue(mode, network, addr string, opts *SocketQueueOptions) (*
 			// Signal that a connection is available
 			q.cond.Broadcast()
 			// Start reader and writer goroutines for the new connection
+			// Start reader and writer goroutines for the new connection.
+			// This function now blocks until both loops signal they have started.
 			q.startConnectionGoroutines(conn)
 		}
 
@@ -226,6 +228,8 @@ func (q *SocketTaskQueue) acceptConnections() {
 		q.mu.Unlock()
 
 		// Start reader and writer goroutines for the new connection
+		// Start reader and writer goroutines for the new connection.
+		// This function now blocks until both loops signal they have started.
 		q.startConnectionGoroutines(conn)
 	}
 }
@@ -248,8 +252,13 @@ func (q *SocketTaskQueue) reconnectClient() {
 
 	for {
 		q.mu.Lock()
+		// Use a loop for the condition check, standard practice with sync.Cond
+		for q.clientConn != nil && !q.closed {
+			slog.Debug("Client connection exists, waiting for disconnection signal...")
+			q.cond.Wait() // Wait for handleConnectionClose or Close to signal
+		}
 		closed := q.closed
-		conn := q.clientConn // Use clientConn for client mode check
+		// At this point, q.clientConn is nil or q.closed is true
 		q.mu.Unlock()
 
 		if closed {
@@ -257,12 +266,7 @@ func (q *SocketTaskQueue) reconnectClient() {
 			return // Exit if the queue is closed
 		}
 
-		if conn != nil {
-			// Connection is active, wait a bit before checking again
-			// This sleep prevents a tight loop if the connection is active but unusable
-			time.Sleep(time.Second)
-			continue
-		}
+		// ---- Connection is confirmed disconnected (q.clientConn == nil), attempt reconnect ----
 
 		slog.Info("Client attempting to reconnect", "network", q.network, "addr", q.addr, "delay", currentDelay)
 		newConn, err := net.Dial(q.network, q.addr)
@@ -279,7 +283,24 @@ func (q *SocketTaskQueue) reconnectClient() {
 				sleepDuration = 0
 			}
 
-			time.Sleep(sleepDuration)
+			// Use time.Timer for cancellable sleep
+			timer := time.NewTimer(sleepDuration)
+			select {
+			case <-timer.C:
+				// Timer expired, continue to next attempt
+			case <-q.ctx.Done():
+				slog.Info("Client reconnection context cancelled during backoff sleep, exiting")
+				// Attempt to stop the timer and drain if necessary
+				if !timer.Stop() {
+					// If Stop returns false, the timer already fired and its channel might need draining.
+					// Select avoids blocking if the channel is already empty.
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return // Queue is closing
+			}
 
 			// Increase delay, cap at maxDelay
 			currentDelay = time.Duration(float64(currentDelay) * factor)
@@ -303,20 +324,12 @@ func (q *SocketTaskQueue) reconnectClient() {
 
 		slog.Info("Client reconnected successfully", "remote_addr", newConn.RemoteAddr())
 
-		// Give the server/network a brief moment after establishing the connection
-		// before starting goroutines that might immediately try to use it.
-		// This might help mitigate potential race conditions where the connection
-		// Start reader and writer goroutines IMMEDIATELY for the new connection
+		// Start reader and writer goroutines IMMEDIATELY for the new connection.
+		// This function now blocks until both loops signal they have started.
 		q.startConnectionGoroutines(newConn)
 
-		// Give loops a moment to start before signaling/proceeding.
-		// This helps ensure that if the connection fails immediately,
-		// the loops have a chance to run, fail, and call handleConnectionClose
-		// to reset q.conn before the test or other logic might incorrectly
-		// assume the connection is stable just because q.conn was briefly set.
-		time.Sleep(100 * time.Millisecond) // Shorter delay after starting loops
-
-		// Signal that a connection is potentially available (loops might fail quickly)
+		// Signal that a connection is potentially available
+		// (loops have confirmed started)
 		q.cond.Broadcast()
 
 		// Reset delay on successful connection attempt (loops might still fail later)
@@ -482,7 +495,7 @@ func (q *SocketTaskQueue) Close() error {
 	// Combine listener and connection errors
 	finalErr := errors.Join(listenerErr, errors.Join(connErrs...)) // Combine all collected non-nil errors
 
-	// 关闭 channel
+	// Close channels
 	close(q.writeChan)
 	close(q.readChan)
 	slog.Debug("readChan closed by Close")
@@ -496,11 +509,19 @@ func (q *SocketTaskQueue) Close() error {
 	return finalErr // Return the combined error
 }
 
-// startConnectionGoroutines starts the reader and writer goroutines for a given connection.
+// startConnectionGoroutines starts the reader and writer goroutines for a given connection
+// and waits for them to signal they have started before returning.
 func (q *SocketTaskQueue) startConnectionGoroutines(conn net.Conn) {
-	q.wg.Add(2) // Add 2 to the WaitGroup for reader and writer goroutines
-	go q.readerLoop(conn)
-	go q.writerLoop(conn)
+	var startWg sync.WaitGroup
+	startWg.Add(2) // Expect signals from reader and writer
+
+	q.wg.Add(2)                     // Add 2 to the main WaitGroup for overall lifecycle management
+	go q.readerLoop(conn, &startWg) // Pass the internal startWg
+	go q.writerLoop(conn, &startWg) // Pass the internal startWg
+
+	// Wait here until both reader and writer have called startWg.Done()
+	startWg.Wait()
+	slog.Debug("Reader and Writer loops confirmed started", "remote_addr", conn.RemoteAddr())
 }
 
 // messageProcessor reads raw message bytes from readChan, deserializes them,
@@ -567,8 +588,8 @@ func (q *SocketTaskQueue) messageProcessor() {
 }
 
 // readerLoop reads messages from the connection and sends them to the readChan.
-func (q *SocketTaskQueue) readerLoop(conn net.Conn) {
-	defer q.wg.Done()
+func (q *SocketTaskQueue) readerLoop(conn net.Conn, startWg *sync.WaitGroup) {
+	defer q.wg.Done() // For the main lifecycle WaitGroup
 	defer func() {
 		slog.Info("Reader loop exiting", "remote_addr", conn.RemoteAddr())
 		// When reader loop exits, it means the connection is broken or closed.
@@ -578,6 +599,9 @@ func (q *SocketTaskQueue) readerLoop(conn net.Conn) {
 
 	slog.Info("Reader loop started", "remote_addr", conn.RemoteAddr())
 	slog.Debug("Reader loop running for connection", "local_addr", conn.LocalAddr(), "remote_addr", conn.RemoteAddr()) // Add detailed log
+
+	// Signal that the reader loop has started
+	startWg.Done()
 
 	for {
 		// Check if the queue is closed or context is done
@@ -623,8 +647,8 @@ func (q *SocketTaskQueue) readerLoop(conn net.Conn) {
 }
 
 // writerLoop reads messages from the writeChan and writes them to the connection.
-func (q *SocketTaskQueue) writerLoop(conn net.Conn) {
-	defer q.wg.Done()
+func (q *SocketTaskQueue) writerLoop(conn net.Conn, startWg *sync.WaitGroup) {
+	defer q.wg.Done() // For the main lifecycle WaitGroup
 	defer func() {
 		slog.Info("Writer loop exiting", "remote_addr", conn.RemoteAddr())
 		// When writer loop exits, it means the connection is broken or closed.
@@ -634,6 +658,9 @@ func (q *SocketTaskQueue) writerLoop(conn net.Conn) {
 
 	slog.Info("Writer loop started", "remote_addr", conn.RemoteAddr())
 	slog.Debug("Writer loop running for connection", "local_addr", conn.LocalAddr(), "remote_addr", conn.RemoteAddr()) // Add detailed log
+
+	// Signal that the writer loop has started
+	startWg.Done()
 
 	for {
 		select {

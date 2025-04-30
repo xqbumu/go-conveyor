@@ -255,7 +255,7 @@ func (m *Manager) processTaskWithRetry(ctx context.Context, task ITask) {
 		case <-taskCtx.Done():
 			slog.Warn("Task canceled or timed out during retry wait",
 				"taskID", task.GetID(),
-				"type", task.GetType,
+				"type", task.GetType(),
 				"error", taskCtx.Err())
 			atomic.AddInt64(&m.metrics.TasksFailed, 1)
 			m.taskSetManager.Remove(taskIdentifier)
@@ -265,10 +265,31 @@ func (m *Manager) processTaskWithRetry(ctx context.Context, task ITask) {
 			// Continue retrying
 		}
 
-		// Wait before retrying (exponential backoff)
+		// Wait before retrying (exponential backoff), allowing cancellation
 		retryDelay := time.Second * time.Duration(i+1)
-		slog.Info("Retrying task", "taskID", task.GetID(), "type", task.GetType, "delay", retryDelay)
-		time.Sleep(retryDelay) // Block and wait
+		slog.Info("Retrying task", "taskID", task.GetID(), "type", task.GetType(), "delay", retryDelay)
+
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-timer.C:
+			// Timer expired, continue with the next retry attempt
+		case <-taskCtx.Done():
+			slog.Warn("Task context cancelled during retry delay",
+				"taskID", task.GetID(),
+				"type", task.GetType(),
+				"error", taskCtx.Err())
+			// Attempt to stop the timer and drain if necessary
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			atomic.AddInt64(&m.metrics.TasksFailed, 1) // Mark as failed due to cancellation during wait
+			m.taskSetManager.Remove(taskIdentifier)
+			atomic.AddInt64(&m.metrics.TasksQueued, -1)
+			return // Context cancelled, exit the function
+		}
 	}
 }
 
@@ -297,11 +318,11 @@ func (m *Manager) AddTask(ctx context.Context, task ITask) error {
 		slog.Warn("Task already exists, skipping addition", "identifier", taskIdentifier)
 		return fmt.Errorf("task already exists: %s", taskIdentifier)
 	}
-	atomic.AddInt64(&m.metrics.TasksQueued, 1) // Task successfully added to the set, increase queued count
+	// Task successfully added to the set, but don't increment queue count yet.
 
 	slog.Debug("Attempting to add task to queue", "identifier", taskIdentifier, "priority", task.GetPriority())
 
-	// 3. Get or create the corresponding queue through ConsumerPoolManager
+	// 2. Get or create the corresponding queue through ConsumerPoolManager
 	// ConsumerPoolManager will be responsible for creating the queue and starting consumers
 	taskQueue, err := m.consumerPoolManager.GetOrCreateQueue(task.GetPriority(), taskIdentifier, m.processTaskWithRetry)
 	if err != nil {
@@ -311,22 +332,30 @@ func (m *Manager) AddTask(ctx context.Context, task ITask) error {
 		return err
 	}
 
-	// 4. Try to push the task to the queue
+	// 3. Try to push the task to the queue
 	sendErr := taskQueue.Push(ctx, task)
 	taskSent := sendErr == nil // Task is sent if Push returns no error
 
 	if sendErr == nil {
+		// Increment queue count only on successful push
+		atomic.AddInt64(&m.metrics.TasksQueued, 1)
 		slog.Info("Task added successfully", "identifier", taskIdentifier, "priority", task.GetPriority())
 	} else {
 		slog.Error("Failed to push task to queue", "identifier", taskIdentifier, "priority", task.GetPriority(), "error", sendErr)
 	}
 
-	// If the task was not successfully sent, perform a rollback
+	// If the task was not successfully sent, perform a rollback (remove from set)
+	// Note: rollbackAddTask decrements the queue count, which we haven't incremented yet if push failed.
+	// We should adjust rollbackAddTask or handle the count here.
+	// Let's modify the logic here: only remove from set, don't decrement count yet.
 	if !taskSent {
-		m.rollbackAddTask(taskIdentifier)
+		// We added it to the set, but failed to push. Remove from set.
+		m.taskSetManager.Remove(taskIdentifier)
+		// Do not call rollbackAddTask as it decrements a count we haven't incremented.
+		slog.Warn("Task push failed, removed from task set", "identifier", taskIdentifier)
 	}
 
-	// 5. Return the send result
+	// 4. Return the send result
 	return sendErr
 }
 

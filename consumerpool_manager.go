@@ -237,8 +237,22 @@ func (cpm *ConsumerPoolManager) startConsumer(taskQueue TaskQueue, processTask p
 			}
 
 			slog.Info("Attempting to restart consumer goroutine", "attempt", restartAttempts, "delay", currentRestartDelay)
-			// Wait for a period of time before attempting to restart, using exponential backoff.
-			time.Sleep(currentRestartDelay)
+			// Wait for a period of time before attempting to restart, using exponential backoff and allowing cancellation.
+			timer := time.NewTimer(currentRestartDelay)
+			select {
+			case <-timer.C:
+				// Timer expired, continue with restart
+			case <-cpm.ctx.Done():
+				slog.Info("Consumer goroutine context cancelled during restart backoff, exiting")
+				// Attempt to stop the timer and drain if necessary
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return // Manager is stopping
+			}
 			currentRestartDelay *= 2 // Exponential backoff increases the delay
 			// The outer loop continues, starting the next inner function execution, i.e., restarting the goroutine.
 		}
